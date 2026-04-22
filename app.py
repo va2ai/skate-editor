@@ -27,6 +27,7 @@ from pathlib import Path
 
 from typing import Iterable
 
+import numpy as np
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 from pydub import AudioSegment
 from yt_dlp import YoutubeDL
@@ -128,48 +129,167 @@ def normalize_cuts(cuts: list[dict], duration_sec: float) -> list[dict]:
     return normalized
 
 
+def _audiosegment_to_float_array(audio: AudioSegment) -> np.ndarray:
+    """Return a (frames, channels) float32 array normalized to ~[-1, 1]. pydub
+    stores samples as interleaved ints; this reshapes and scales them once so
+    the render loop can splice on sample boundaries."""
+    raw = np.array(audio.get_array_of_samples())
+    if audio.channels > 1:
+        raw = raw.reshape(-1, audio.channels)
+    else:
+        raw = raw.reshape(-1, 1)
+    max_val = float(1 << (8 * audio.sample_width - 1))  # e.g. 32768 for 16-bit
+    return raw.astype(np.float32) / max_val
+
+
+def _float_array_to_audiosegment(buf: np.ndarray, frame_rate: int, sample_width: int, channels: int) -> AudioSegment:
+    """Inverse of _audiosegment_to_float_array. Clips to the int range before
+    casting so a crossfade sum doesn't wrap around into the opposite polarity."""
+    max_val = float(1 << (8 * sample_width - 1))
+    int_dtype = {1: np.int8, 2: np.int16, 4: np.int32}[sample_width]
+    clipped = np.clip(buf, -1.0, 1.0 - 1.0 / max_val)
+    ints = (clipped * max_val).astype(int_dtype)
+    return AudioSegment(
+        ints.tobytes(),
+        frame_rate=frame_rate,
+        sample_width=sample_width,
+        channels=channels,
+    )
+
+
+def nearest_zero_crossing(mono: np.ndarray, frame: int, radius: int) -> int:
+    """Find a frame near `frame` (within ±radius samples) where the mono
+    downmix crosses zero, falling back to the local minimum-amplitude frame if
+    no sign change is found. Splicing here turns the splice-point discontinuity
+    from a step to (near) zero, which is what eliminates audible clicks."""
+    n = mono.shape[0]
+    if n == 0:
+        return max(0, min(n, frame))
+    lo = max(1, frame - radius)
+    hi = min(n - 1, frame + radius)
+    if hi <= lo:
+        return max(0, min(n, frame))
+    window = mono[lo - 1:hi + 1]
+    # A sign change between samples i-1 and i means a zero crossing at index i (in window coords).
+    prev = window[:-1]
+    curr = window[1:]
+    crossings = np.where((prev * curr) <= 0)[0]
+    if crossings.size > 0:
+        # Pick the crossing whose sample is closest to zero — avoids landing on
+        # a zero-touching peak where the neighborhood slope is still huge.
+        candidates = crossings + 1  # shift from diff index to window index
+        abs_at = np.abs(window[candidates])
+        best_local = candidates[int(np.argmin(abs_at))]
+        return lo - 1 + int(best_local)
+    # No sign change in window — fall back to the absolute-minimum amplitude.
+    local_idx = int(np.argmin(np.abs(window)))
+    return lo - 1 + local_idx
+
+
+def equal_power_crossfade(left_tail: np.ndarray, right_head: np.ndarray) -> np.ndarray:
+    """Constant-power (sqrt) crossfade across the overlap region. pydub's
+    built-in crossfade uses linear gain ramps, which produce a ~3 dB midpoint
+    dip for uncorrelated musical content or a loudness bump for correlated
+    content. sin/cos ramps keep perceived loudness flat across the seam."""
+    n = min(left_tail.shape[0], right_head.shape[0])
+    if n <= 0:
+        return np.zeros((0, left_tail.shape[1] if left_tail.ndim > 1 else 1), dtype=np.float32)
+    t = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    gain_left = np.cos(t * (np.pi / 2.0))  # sqrt(1-t) family
+    gain_right = np.sin(t * (np.pi / 2.0))  # sqrt(t) family
+    if left_tail.ndim > 1:
+        gain_left = gain_left[:, None]
+        gain_right = gain_right[:, None]
+    return left_tail[:n] * gain_left + right_head[:n] * gain_right
+
+
 def render_audio_from_cuts(
     src: Path,
     cuts: list[dict],
-    crossfade_ms: int = 250,
+    crossfade_ms: int = 400,
     fade_in_ms: int = 100,
     fade_out_ms: int = 2000,
     target_format: str = "mp3",
     bitrate: str = "192k",
     output_id: str | None = None,
+    zero_crossing_radius_ms: float = 10.0,
 ) -> dict:
     audio = AudioSegment.from_file(src)
+    frame_rate = audio.frame_rate
+    sample_width = audio.sample_width
+    channels = audio.channels
     total_ms = len(audio)
+    total_frames = int(audio.frame_count())
     norm_cuts = normalize_cuts(cuts, total_ms / 1000.0)
 
+    samples = _audiosegment_to_float_array(audio)
+    mono = samples.mean(axis=1) if samples.ndim > 1 else samples
+    zc_radius = max(1, int(zero_crossing_radius_ms * 0.001 * frame_rate))
+
+    def ms_to_frame(ms: float) -> int:
+        return max(0, min(total_frames, int(round(ms * 0.001 * frame_rate))))
+
+    # Cuts are REMOVE regions — invert into KEEP regions in frame units.
     keep_regions: list[tuple[int, int]] = []
     cursor = 0
     for c in norm_cuts:
-        s = max(0, int(c["start"] * 1000))
-        e = min(total_ms, int(c["end"] * 1000))
+        s = ms_to_frame(c["start"] * 1000.0)
+        e = ms_to_frame(c["end"] * 1000.0)
         if s > cursor:
             keep_regions.append((cursor, s))
         cursor = max(cursor, e)
-    if cursor < total_ms:
-        keep_regions.append((cursor, total_ms))
+    if cursor < total_frames:
+        keep_regions.append((cursor, total_frames))
 
     if not keep_regions:
         raise ValueError("Nothing left to keep — your cuts cover the entire song")
 
-    out: AudioSegment | None = None
-    for (s, e) in keep_regions:
-        clip = audio[s:e]
-        if out is None:
-            out = clip
-        else:
-            cf = min(crossfade_ms, len(out), len(clip))
-            try:
-                out = out.append(clip, crossfade=cf)
-            except Exception:
-                out = out + clip
+    # Zero-crossing snap both sides of every splice. The very start and very
+    # end of the program are left alone (fade_in/fade_out will handle them).
+    refined: list[tuple[int, int]] = []
+    for idx, (s, e) in enumerate(keep_regions):
+        rs = s if idx == 0 else nearest_zero_crossing(mono, s, zc_radius)
+        re_ = e if idx == len(keep_regions) - 1 else nearest_zero_crossing(mono, e, zc_radius)
+        # Keep regions ordered and non-empty even after the snap.
+        if refined and rs < refined[-1][1]:
+            rs = refined[-1][1]
+        if re_ <= rs:
+            continue
+        refined.append((rs, re_))
 
-    if out is None:
-        raise ValueError("No audio produced")
+    if not refined:
+        raise ValueError("Cuts left no renderable audio after alignment")
+
+    cf_frames_requested = int(max(0, crossfade_ms) * 0.001 * frame_rate)
+
+    pieces: list[np.ndarray] = []
+    for idx, (s, e) in enumerate(refined):
+        clip = samples[s:e]
+        if idx == 0:
+            pieces.append(clip)
+            continue
+        prev = pieces[-1]
+        # Clamp crossfade to half of the shorter clip so a splice never eats
+        # the entire previous keep region or bleeds into the next one.
+        cf = min(cf_frames_requested, prev.shape[0] // 2, clip.shape[0] // 2)
+        if cf <= 0:
+            pieces.append(clip)
+            continue
+        try:
+            left_tail = prev[-cf:]
+            right_head = clip[:cf]
+            blended = equal_power_crossfade(left_tail, right_head)
+            pieces[-1] = prev[:-cf]
+            pieces.append(blended)
+            pieces.append(clip[cf:])
+        except (ValueError, IndexError) as err:
+            # Shape mismatch or similar — surface it rather than silently
+            # hard-concatenating; a click in this case is a fixable bug.
+            app.logger.warning("crossfade failed, falling back to hard concat: %s", err)
+            pieces.append(clip)
+
+    out_buf = np.concatenate(pieces, axis=0) if pieces else np.zeros((0, channels), dtype=np.float32)
+    out = _float_array_to_audiosegment(out_buf, frame_rate, sample_width, channels)
 
     if fade_in_ms > 0 and len(out) > fade_in_ms:
         out = out.fade_in(fade_in_ms)
@@ -485,20 +605,31 @@ def process():
     file_id = data["file_id"]
     ext = data["ext"]
     cuts = sorted(data.get("cuts", []), key=lambda c: c["start"])
-    crossfade_ms = int(data.get("crossfade_ms", 250))
+    crossfade_ms = int(data.get("crossfade_ms", 400))
     fade_out_ms = int(data.get("fade_out_ms", 2000))
     fade_in_ms = int(data.get("fade_in_ms", 100))
     target_format = data.get("target_format", "mp3")
     bitrate = data.get("bitrate", "192k")
+    align = bool(data.get("align", True))
 
     src = WORK_DIR / f"{file_id}.{ext}"
     if not src.exists():
         return jsonify({"error": "source file not found"}), 404
 
+    # Run user-submitted cuts through the same beat/vocal alignment the AI
+    # cuts get — users dragging regions on the waveform would otherwise splice
+    # at arbitrary sub-beat positions. Falls through to the raw cuts only when
+    # the analysis sidecar is missing (pre-analyze state).
+    aligned_cuts = cuts
+    if align:
+        analysis = load_analysis_sidecar(file_id)
+        if analysis:
+            aligned_cuts = sanitize_cut_list(cuts, analysis)
+
     try:
         result = render_audio_from_cuts(
             src=src,
-            cuts=cuts,
+            cuts=aligned_cuts,
             crossfade_ms=crossfade_ms,
             fade_in_ms=fade_in_ms,
             fade_out_ms=fade_out_ms,
@@ -508,6 +639,9 @@ def process():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+    # Echo the aligned cuts back so the frontend can redraw regions on the
+    # snapped positions — the user sees where the splice actually landed.
+    result["aligned_cuts"] = aligned_cuts
     return jsonify(result)
 
 
@@ -1343,6 +1477,18 @@ def _align_boundary(
     return aligned
 
 
+def _boundary_candidates(t: float, beats: list[float], window: float = 0.25, max_count: int = 3) -> list[float]:
+    """Return up to `max_count` beat-grid candidates near `t` within ±window
+    seconds, deduplicated and sorted by distance from `t`. Always includes `t`
+    itself so the pair-optimizer can choose 'don't move'."""
+    out = {round(float(t), 3): None}
+    for b in beats or []:
+        if abs(b - t) <= window:
+            out[round(float(b), 3)] = None
+    ranked = sorted(out.keys(), key=lambda x: abs(x - t))
+    return ranked[:max_count + 1]  # +1 to include `t` alongside up to max_count beat anchors
+
+
 def sanitize_cut_list(cuts: list, analysis: dict) -> list[dict]:
     duration = float(analysis["duration_sec"])
     boundaries = list(analysis.get("section_boundaries", []))
@@ -1372,6 +1518,37 @@ def sanitize_cut_list(cuts: list, analysis: dict) -> list[dict]:
     for c in valid:
         if not merged or c["start"] >= merged[-1]["end"]:
             merged.append(c)
+
+    # Second pass: jointly optimize each adjacent boundary pair that becomes a
+    # splice in the output. For cuts[i] and cuts[i+1], the splice is between
+    # cuts[i].end and cuts[i+1].start — pick the combination within the beat
+    # tolerance that minimizes transition_penalty over the splice pair rather
+    # than each side alone. Also scores the leading/trailing splices against
+    # the start/end of the track so fades land on compatible phases.
+    for i, cut in enumerate(merged):
+        end_candidates = _boundary_candidates(cut["end"], beats)
+        start_of_next = merged[i + 1]["start"] if i + 1 < len(merged) else None
+        if start_of_next is not None:
+            start_candidates = _boundary_candidates(start_of_next, beats)
+            best = (cut["end"], start_of_next, transition_penalty(analysis, cut["end"], start_of_next))
+            for e_cand in end_candidates:
+                if e_cand <= cut["start"] + 0.1:
+                    continue
+                for s_cand in start_candidates:
+                    if s_cand <= e_cand + 0.1:
+                        continue
+                    if i + 2 < len(merged) and s_cand >= merged[i + 2]["start"] - 0.1:
+                        continue
+                    pen = transition_penalty(analysis, e_cand, s_cand)
+                    if pen < best[2]:
+                        best = (e_cand, s_cand, pen)
+            cut["end"] = round(best[0], 2)
+            merged[i + 1]["start"] = round(best[1], 2)
+            cut["splice_penalty"] = round(best[2], 3)
+        else:
+            # Trailing splice — evaluated against end-of-track.
+            cut["splice_penalty"] = round(transition_penalty(analysis, cut["end"], duration), 3)
+
     return merged
 
 
