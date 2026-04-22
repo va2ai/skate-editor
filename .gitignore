@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Runtime artifacts (uploads, rendered audio, waveform PNGs, analysis sidecars).
+# Already in .dockerignore so they don't ship in images; also keep them out of git.
+workspace/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

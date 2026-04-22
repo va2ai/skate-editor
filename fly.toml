@@ -1,0 +1,39 @@
+# fly.toml — https://fly.io/docs/reference/configuration/
+# Run `fly launch --copy-config --no-deploy` to create the Fly app using this file,
+# then `fly volumes create skate_workspace --size 3 --region <primary_region>`,
+# then `fly secrets set GEMINI_API_KEY=...`, then `fly deploy`.
+
+app = "skate-editor-b49844"
+primary_region = "iad"  # pick one near you: https://fly.io/docs/reference/regions/
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # AI_PROVIDER defaults to "gemini"; set via `fly secrets` if you want to change.
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Scale to zero when idle — single-user app, saves money. Cold start is ~5s.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  # Streaming endpoints (/analyze, /optimize_audition) keep connections open
+  # for 60–120s; Fly's proxy allows up to 5 min by default, longer with
+  # response_timeout. We don't override because NDJSON heartbeats already
+  # keep the socket warm.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"  # librosa + pydub peak around 500–700 MB on a 4-min track
+
+# Persistent workspace so uploads, renders, and analysis sidecars survive
+# redeploys and machine restarts. Create with:
+#   fly volumes create skate_workspace --size 3 --region <primary_region>
+[[mounts]]
+  source = "skate_workspace"
+  destination = "/app/workspace"

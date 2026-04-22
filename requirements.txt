@@ -7,3 +7,5 @@ anthropic>=0.40
 google-genai>=1.0
 
 matplotlib>=3.8
+
+yt-dlp>=2024.8.6

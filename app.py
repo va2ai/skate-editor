@@ -20,20 +20,74 @@ import mimetypes
 import os
 import re
 import statistics
+import threading
+import time
 import uuid
 from pathlib import Path
 
 from typing import Iterable
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 from pydub import AudioSegment
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 BASE_DIR = Path(__file__).parent
 WORK_DIR = BASE_DIR / "workspace"
 WORK_DIR.mkdir(exist_ok=True)
 
+# Short build identifier — combines the mtime of app.py with the server start time.
+# The app.py component changes when the code changes; the start-time component
+# changes on every restart. If the value shown in the UI doesn't match what the
+# server is currently returning, the browser is serving a cached page.
+import time as _time
+try:
+    _app_mtime = int(Path(__file__).stat().st_mtime)
+except OSError:
+    _app_mtime = 0
+BUILD_ID = f"{_app_mtime:x}.{int(_time.time()):x}"[-10:]
+
 ALLOWED_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "flac", "ogg"}
 MAX_UPLOAD_MB = 50
+MAX_URL_DURATION_SEC = 20 * 60
+
+# User-facing and AI-facing descriptions of each program_style choice. Keep in
+# sync with AI_STYLE_HINTS in templates/index.html — same keys, same wording.
+STYLE_DESCRIPTIONS = {
+    "balanced": "Default — even mix of rhythmic coherence, vocal phrasing, and emotional arc. No single priority dominates.",
+    "dramatic": "Prioritizes big moments — climaxes, drops, key changes. Willing to accept slightly rougher joins if they land on a peak.",
+    "lyrical": "Preserves vocal phrases and melodic lines. Gentler transitions, fewer cuts mid-phrase, more on-breath edits.",
+    "technical": "Tight on-beat/downbeat joins and rhythmic coherence. Skating-grid friendly; prioritizes predictable pulse over emotion.",
+    "aggressive": "Bigger removals, willing to skip whole sections for pace. Favors high-energy material; drops softer bridges and intros.",
+}
+
+
+def style_description(name: str) -> str:
+    return STYLE_DESCRIPTIONS.get((name or "").strip().lower(), STYLE_DESCRIPTIONS["balanced"])
+
+
+def analysis_sidecar_path(file_id: str) -> Path:
+    return WORK_DIR / f"{file_id}.analysis.json"
+
+
+def save_analysis_sidecar(file_id: str, analysis: dict) -> None:
+    """Persist the analysis dict so follow-up endpoints (e.g. /optimize_audition)
+    don't have to re-run librosa — that costs 20–90s on a typical track."""
+    try:
+        analysis_sidecar_path(file_id).write_text(json.dumps(analysis), encoding="utf-8")
+    except OSError:
+        # Best-effort: the feature degrades to "run analyze first" without this, not a hard failure.
+        pass
+
+
+def load_analysis_sidecar(file_id: str) -> dict | None:
+    p = analysis_sidecar_path(file_id)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 # Default multimodal provider. Gemini is the primary full-audio path.
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").strip().lower()
@@ -42,6 +96,11 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+# Auto-reload Jinja templates even without debug mode. Without this, template
+# edits are silently ignored until the server restarts, which is a very easy
+# way to waste 20 minutes chasing a "my change didn't take effect" bug.
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
 
 
 def allowed(filename: str) -> bool:
@@ -139,7 +198,17 @@ def render_audio_from_cuts(
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # Disable caching for the HTML shell so a reload always pulls the latest
+    # template; the inline JS is fingerprinted with BUILD_ID for a visible signal.
+    resp = app.make_response(render_template("index.html", build_id=BUILD_ID))
+    resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
+@app.route("/build_id")
+def build_id():
+    return jsonify({"build_id": BUILD_ID})
 
 
 @app.route("/upload", methods=["POST"])
@@ -168,6 +237,96 @@ def upload():
         "ext": ext,
         "duration_sec": len(audio) / 1000.0,
         "original_name": f.filename,
+    })
+
+
+@app.route("/download_url", methods=["POST"])
+def download_url():
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+    if not re.match(r"^https?://", url, re.I):
+        return jsonify({"error": "only http(s) URLs are supported"}), 400
+
+    file_id = uuid.uuid4().hex
+    out_path = WORK_DIR / f"{file_id}.mp3"
+
+    # yt-dlp needs a JavaScript runtime to negotiate YouTube's signed media URLs;
+    # without it, downloads fall back to formats that often 403. node is widely
+    # available and works for the YouTube extractor.
+    yt_js_runtimes = {"node": {}}
+
+    probe_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "js_runtimes": yt_js_runtimes,
+    }
+    try:
+        with YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except DownloadError as e:
+        return jsonify({"error": f"Could not read URL: {e}"}), 400
+
+    if info.get("_type") == "playlist":
+        entries = [e for e in (info.get("entries") or []) if e]
+        if not entries:
+            return jsonify({"error": "Playlist has no entries"}), 400
+        info = entries[0]
+
+    duration = float(info.get("duration") or 0)
+    if duration <= 0:
+        return jsonify({"error": "Could not determine duration for this URL"}), 400
+    if duration > MAX_URL_DURATION_SEC:
+        return jsonify({
+            "error": f"Video is {duration/60:.1f} min; max {MAX_URL_DURATION_SEC//60} min"
+        }), 400
+
+    title = (info.get("title") or "download").strip()
+
+    download_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "format": "bestaudio/best",
+        "outtmpl": str(WORK_DIR / f"{file_id}.%(ext)s"),
+        "js_runtimes": yt_js_runtimes,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    }
+    try:
+        with YoutubeDL(download_opts) as ydl:
+            ydl.download([url])
+    except DownloadError as e:
+        for p in WORK_DIR.glob(f"{file_id}.*"):
+            p.unlink(missing_ok=True)
+        return jsonify({"error": f"Download failed: {e}"}), 502
+
+    if not out_path.exists():
+        for p in WORK_DIR.glob(f"{file_id}.*"):
+            p.unlink(missing_ok=True)
+        return jsonify({"error": "Download completed but mp3 was not produced"}), 500
+
+    if out_path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
+        out_path.unlink(missing_ok=True)
+        return jsonify({"error": f"Downloaded file exceeds {MAX_UPLOAD_MB} MB"}), 400
+
+    try:
+        audio = AudioSegment.from_file(out_path)
+    except Exception as e:
+        out_path.unlink(missing_ok=True)
+        return jsonify({"error": f"Could not decode downloaded audio: {e}"}), 500
+
+    return jsonify({
+        "file_id": file_id,
+        "ext": "mp3",
+        "duration_sec": len(audio) / 1000.0,
+        "original_name": f"{title}.mp3",
     })
 
 
@@ -200,16 +359,13 @@ def analyze():
     Run local music-structure analysis and optionally ask the LLM for
     stronger cut suggestions built on top of those heuristics.
 
-    Body: {
-        "file_id": "...",
-        "ext": "mp3",
-        "target_sec": 150,
-        "discipline": "Junior FS",
-        "program_style": "balanced",
-        "aggressiveness": 50,
-        "num_options": 3,
-        "use_ai": true
-    }
+    Response is NDJSON (one JSON object per line) so the connection stays warm
+    during the slow multimodal AI step — which takes 60-120s and otherwise gets
+    killed by browser/proxy idle timeouts. Lines:
+      {"type":"status", "stage":"...", "elapsed":float, ...}
+      {"type":"heartbeat", "elapsed":float}    # emitted every few seconds
+      {"type":"result", "analysis":..., "suggestion":..., "ai_error":...}
+      {"type":"error", "error":"..."}
     """
     data = request.get_json(force=True)
     file_id = data["file_id"]
@@ -226,44 +382,92 @@ def analyze():
     if not src.exists():
         return jsonify({"error": "source file not found"}), 404
 
-    try:
-        analysis = analyze_audio(src)
-    except ImportError as e:
-        return jsonify({"error": f"librosa not installed: {e}"}), 500
-    except Exception as e:
-        return jsonify({"error": f"audio analysis failed: {e}"}), 500
+    t0 = time.monotonic()
 
-    suggestion = None
-    ai_error = None
-    if target_sec:
-        analysis["local_candidates"] = build_cut_candidates(analysis, float(target_sec), aggressiveness)
-        analysis["recommended_opening_guard_sec"] = min(20.0, max(10.0, analysis["duration_sec"] * 0.08))
-        analysis["recommended_ending_guard_sec"] = min(25.0, max(12.0, analysis["duration_sec"] * 0.1))
-    try:
-        waveform_path = generate_waveform_image(src, file_id=file_id, analysis=analysis)
-        analysis["waveform_image_url"] = f"/waveform_image/{file_id}.{ext}?v={int(waveform_path.stat().st_mtime)}"
-    except Exception as e:
-        analysis["waveform_image_error"] = str(e)
-    if use_ai and target_sec:
+    def _emit(obj):
+        return json.dumps(obj, separators=(",", ":")) + "\n"
+
+    def generate():
         try:
-            suggestion = ai_suggest_cuts(
-                src_path=src,
-                analysis=analysis,
-                target_sec=float(target_sec),
-                discipline=discipline,
-                program_style=program_style,
-                aggressiveness=aggressiveness,
-                num_options=num_options,
-                provider=ai_provider,
-            )
-        except Exception as e:
-            ai_error = str(e)
+            yield _emit({"type": "status", "stage": "analyzing_audio", "elapsed": round(time.monotonic() - t0, 2)})
+            try:
+                analysis = analyze_audio(src)
+            except ImportError as e:
+                yield _emit({"type": "error", "error": f"librosa not installed: {e}"})
+                return
+            except Exception as e:
+                yield _emit({"type": "error", "error": f"audio analysis failed: {e}"})
+                return
 
-    return jsonify({
-        "analysis": analysis,
-        "suggestion": suggestion,
-        "ai_error": ai_error,
-    })
+            if target_sec:
+                analysis["local_candidates"] = build_cut_candidates(analysis, float(target_sec), aggressiveness)
+                analysis["recommended_opening_guard_sec"] = min(20.0, max(10.0, analysis["duration_sec"] * 0.08))
+                analysis["recommended_ending_guard_sec"] = min(25.0, max(12.0, analysis["duration_sec"] * 0.1))
+            try:
+                waveform_path = generate_waveform_image(src, file_id=file_id, analysis=analysis)
+                analysis["waveform_image_url"] = f"/waveform_image/{file_id}.{ext}?v={int(waveform_path.stat().st_mtime)}"
+            except Exception as e:
+                analysis["waveform_image_error"] = str(e)
+
+            # Cache the full analysis to disk so /optimize_audition can reuse it
+            # without paying the librosa cost again.
+            save_analysis_sidecar(file_id, analysis)
+
+            suggestion = None
+            ai_error = None
+
+            if use_ai and target_sec:
+                yield _emit({
+                    "type": "status",
+                    "stage": "asking_ai",
+                    "provider": ai_provider,
+                    "elapsed": round(time.monotonic() - t0, 2),
+                })
+                # Run the AI call in a thread so we can keep the HTTP connection
+                # warm with heartbeats; multimodal Gemini can take 1–2 minutes.
+                result_ref = {"suggestion": None, "ai_error": None}
+                done = threading.Event()
+
+                def _run_ai():
+                    try:
+                        result_ref["suggestion"] = ai_suggest_cuts(
+                            src_path=src,
+                            analysis=analysis,
+                            target_sec=float(target_sec),
+                            discipline=discipline,
+                            program_style=program_style,
+                            aggressiveness=aggressiveness,
+                            num_options=num_options,
+                            provider=ai_provider,
+                        )
+                    except Exception as e:
+                        result_ref["ai_error"] = str(e)
+                    finally:
+                        done.set()
+
+                worker = threading.Thread(target=_run_ai, daemon=True)
+                worker.start()
+                while not done.wait(timeout=4.0):
+                    yield _emit({"type": "heartbeat", "elapsed": round(time.monotonic() - t0, 2)})
+                suggestion = result_ref["suggestion"]
+                ai_error = result_ref["ai_error"]
+
+            yield _emit({
+                "type": "result",
+                "elapsed": round(time.monotonic() - t0, 2),
+                "analysis": analysis,
+                "suggestion": suggestion,
+                "ai_error": ai_error,
+            })
+        except GeneratorExit:
+            # Client disconnected — nothing to do; the daemon thread will finish on its own.
+            return
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+    )
 
 
 @app.route("/process", methods=["POST"])
@@ -367,6 +571,155 @@ def render_auditions():
     return jsonify({"auditions": rendered})
 
 
+@app.route("/optimize_audition", methods=["POST"])
+def optimize_audition():
+    """Send a rendered audition preview to Gemini, get a refined cut list,
+    re-render, return the new audition entry. NDJSON stream so the slow Gemini
+    call (60–120s) doesn't die on browser/proxy idle timeouts."""
+    data = request.get_json(force=True)
+    file_id = data["file_id"]
+    ext = data["ext"]
+    audition_output_id = data["audition_output_id"]
+    audition_format = data.get("audition_format", "mp3")
+    original_plan = data.get("original_plan") or {}
+    target_sec = float(data.get("target_sec") or 0)
+    discipline = data.get("discipline", "")
+    program_style = data.get("program_style", "balanced")
+    aggressiveness = int(data.get("aggressiveness", 50))
+    render_opts = data.get("render_opts") or {}
+
+    src = WORK_DIR / f"{file_id}.{ext}"
+    audition_path = WORK_DIR / f"{audition_output_id}.{audition_format}"
+    if not src.exists():
+        return jsonify({"error": "source file not found"}), 404
+    if not audition_path.exists():
+        return jsonify({"error": "audition preview not found"}), 404
+
+    analysis = load_analysis_sidecar(file_id)
+    if not analysis:
+        return jsonify({"error": "no cached analysis for this source — run Analyze first"}), 400
+
+    t0 = time.monotonic()
+
+    def _emit(obj):
+        return json.dumps(obj, separators=(",", ":")) + "\n"
+
+    def generate():
+        try:
+            yield _emit({
+                "type": "status",
+                "stage": "asking_ai",
+                "provider": "gemini",
+                "elapsed": round(time.monotonic() - t0, 2),
+            })
+            result_ref = {"refined": None, "ai_error": None}
+            done = threading.Event()
+
+            def _run_ai():
+                try:
+                    result_ref["refined"] = ai_optimize_audition_with_gemini(
+                        audition_path=audition_path,
+                        analysis=analysis,
+                        original_plan=original_plan,
+                        target_sec=target_sec,
+                        discipline=discipline,
+                        program_style=program_style,
+                        aggressiveness=aggressiveness,
+                    )
+                except Exception as e:
+                    result_ref["ai_error"] = str(e)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=_run_ai, daemon=True)
+            worker.start()
+            while not done.wait(timeout=4.0):
+                yield _emit({"type": "heartbeat", "elapsed": round(time.monotonic() - t0, 2)})
+
+            refined = result_ref["refined"]
+            ai_error = result_ref["ai_error"]
+            if ai_error or not refined:
+                yield _emit({
+                    "type": "result",
+                    "elapsed": round(time.monotonic() - t0, 2),
+                    "ai_error": ai_error or "AI returned no plan",
+                    "audition": None,
+                })
+                return
+
+            # Same sanitization pipeline as AI-suggested cuts: snap to section
+            # + beat grid, escape vocal intervals.
+            refined_cuts = sanitize_cut_list(refined.get("cuts") or [], analysis)
+            if not refined_cuts:
+                yield _emit({
+                    "type": "result",
+                    "elapsed": round(time.monotonic() - t0, 2),
+                    "ai_error": "refined plan had no valid cuts after sanitization",
+                    "audition": None,
+                })
+                return
+
+            yield _emit({
+                "type": "status",
+                "stage": "rendering",
+                "elapsed": round(time.monotonic() - t0, 2),
+            })
+            try:
+                rendered = render_audio_from_cuts(
+                    src=src,
+                    cuts=refined_cuts,
+                    crossfade_ms=int(render_opts.get("crossfade_ms", 250)),
+                    fade_in_ms=int(render_opts.get("fade_in_ms", 100)),
+                    fade_out_ms=int(render_opts.get("fade_out_ms", 2000)),
+                    target_format=str(render_opts.get("target_format", "mp3")),
+                    bitrate=str(render_opts.get("bitrate", "192k")),
+                    output_id=f"opt_{file_id[:8]}_{uuid.uuid4().hex[:12]}",
+                )
+            except Exception as e:
+                yield _emit({
+                    "type": "result",
+                    "elapsed": round(time.monotonic() - t0, 2),
+                    "ai_error": f"render failed: {e}",
+                    "audition": None,
+                })
+                return
+
+            audition_entry = {
+                "plan_id": f"optimized-of-{original_plan.get('title') or 'plan'}",
+                "title": str(refined.get("title") or "Optimized")[:80],
+                "summary": str(refined.get("summary") or "")[:300],
+                "confidence": refined.get("confidence"),
+                "transition_risk": (str(refined.get("transition_risk") or "")[:20] or None),
+                "changes": [str(c)[:240] for c in (refined.get("changes") or [])][:10],
+                "removed_sec": round(sum(c["end"] - c["start"] for c in refined_cuts), 2),
+                "duration_sec": rendered["duration_sec"],
+                "format": rendered["format"],
+                "size_bytes": rendered["size_bytes"],
+                "output_id": rendered["output_id"],
+                "download_url": f"/download/{rendered['output_id']}.{rendered['format']}",
+                "preview_url": f"/audio/{rendered['output_id']}.{rendered['format']}",
+                "cuts": refined_cuts,
+                "origin": {
+                    "optimized_from_output_id": audition_output_id,
+                    "optimized_from_title": str(original_plan.get("title") or "")[:80],
+                },
+            }
+            yield _emit({
+                "type": "result",
+                "elapsed": round(time.monotonic() - t0, 2),
+                "audition": audition_entry,
+                "ai_error": None,
+            })
+        except GeneratorExit:
+            return
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+    )
+
+
 @app.route("/download/<output_id>.<fmt>")
 def download(output_id: str, fmt: str):
     path = WORK_DIR / f"{output_id}.{fmt}"
@@ -377,6 +730,27 @@ def download(output_id: str, fmt: str):
         as_attachment=True,
         download_name=f"skate_program_{output_id[:8]}.{fmt}",
         mimetype=f"audio/{fmt}",
+    )
+
+
+@app.route("/download_source/<file_id>.<ext>")
+def download_source(file_id: str, ext: str):
+    path = WORK_DIR / f"{file_id}.{ext}"
+    if not path.exists():
+        return jsonify({"error": "not found"}), 404
+    # Respect a client-supplied name if provided; strip path separators so we
+    # don't let a malicious query string escape the download filename.
+    raw_name = (request.args.get("name") or "").strip()
+    safe_name = re.sub(r"[\\/:*?\"<>|\r\n]+", "_", raw_name) if raw_name else ""
+    if not safe_name:
+        safe_name = f"source_{file_id[:8]}.{ext}"
+    elif not safe_name.lower().endswith(f".{ext.lower()}"):
+        safe_name = f"{safe_name}.{ext}"
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name=safe_name,
+        mimetype=f"audio/{ext}",
     )
 
 
@@ -582,11 +956,18 @@ def analyze_audio(path: Path) -> dict:
     climax_time = energy_curve[max(range(len(energy_curve)), key=lambda i: energy_curve[i][1])][0] if energy_curve else duration
     phrase_grid_sec = round(max(2.0, min(16.0, (60.0 / max(60.0, tempo_val)) * 8.0)), 2)
 
+    # Heuristic downbeats: assume 4/4 meter, every 4th beat is a downbeat. This is
+    # not perfect — waltzes, 6/8, and syncopated pop will be wrong — but for the
+    # vast majority of skating music (and as guidance to the LLM) it's useful,
+    # and the LLM still ultimately listens to the audio.
+    downbeat_times = [round(t, 3) for t in beat_times[::4]] if beat_times else []
+
     return {
         'duration_sec': duration,
         'tempo_bpm': round(tempo_val, 1),
         'num_beats': len(beat_times),
         'beat_times': [round(t, 3) for t in beat_times],
+        'downbeat_times': downbeat_times,
         'section_boundaries': section_boundaries,
         'energy_curve': energy_curve,
         'onset_curve': onset_curve,
@@ -607,6 +988,77 @@ def snap_to_boundaries(value: float, boundaries: list[float], duration: float, t
     if abs(nearest - value) <= tolerance:
         return round(float(nearest), 2)
     return round(float(value), 2)
+
+
+def _nearest(value: float, candidates: list[float]) -> tuple[float, float]:
+    """Return (nearest_candidate, absolute_distance). If candidates is empty, returns (value, inf)."""
+    if not candidates:
+        return value, float("inf")
+    best = min(candidates, key=lambda x: abs(x - value))
+    return float(best), abs(best - value)
+
+
+def snap_to_grid(
+    value: float,
+    boundaries: list[float],
+    beats: list[float],
+    duration: float,
+    section_tolerance: float = 0.75,
+    beat_tolerance: float = 0.25,
+) -> float:
+    """Coarse-then-fine snap: first to a section boundary (big semantic jump),
+    then to the nearest beat (fine perceptual alignment). A pure beat snap still
+    happens even when no section boundary is in range — this is what stops cuts
+    from landing mid-beat, which is the loudest audible tell of an edit."""
+    anchors = [0.0, *(boundaries or []), duration]
+    snapped, dist = _nearest(value, anchors)
+    if dist > section_tolerance:
+        snapped = value
+    if beats:
+        beat, bdist = _nearest(snapped, beats)
+        if bdist <= beat_tolerance:
+            snapped = beat
+    return round(float(max(0.0, min(duration, snapped))), 3)
+
+
+def _interval_contains(intervals: list[dict], t: float) -> dict | None:
+    for iv in intervals or []:
+        try:
+            s = float(iv.get("start", 0.0))
+            e = float(iv.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if s <= t <= e:
+            return {"start": s, "end": e}
+    return None
+
+
+def avoid_vocal(
+    value: float,
+    vocal_intervals: list[dict],
+    beats: list[float],
+    boundaries: list[float],
+    duration: float,
+    search_radius: float = 1.5,
+) -> float:
+    """If `value` lands inside a vocal interval, move it to the closest non-vocal
+    moment within ±search_radius, preferring the outer edge of that interval
+    (silence just before or just after the sung phrase). Then re-snap to the
+    beat grid so the moved point still lands on a strong rhythmic position."""
+    iv = _interval_contains(vocal_intervals, value)
+    if iv is None:
+        return value
+    # Candidate "escape" points: just before the interval starts, or just after it ends.
+    candidates = []
+    if value - iv["start"] <= search_radius:
+        candidates.append(max(0.0, iv["start"] - 0.05))
+    if iv["end"] - value <= search_radius:
+        candidates.append(min(duration, iv["end"] + 0.05))
+    if not candidates:
+        # Too deep inside a long vocal phrase — leave the caller to penalize rather than teleport.
+        return value
+    target = min(candidates, key=lambda x: abs(x - value))
+    return snap_to_grid(target, boundaries, beats, duration)
 
 
 def interpolate_curve(curve: list[list[float]], t: float) -> float:
@@ -635,17 +1087,49 @@ def average_curve(curve: list[list[float]], start: float, end: float) -> float:
     return round(float(sum(vals) / len(vals)), 3)
 
 
+def _beat_phase_penalty(t: float, beats: list[float], beat_period: float) -> float:
+    """0.0 = exactly on a beat, 1.0 = exactly between two beats."""
+    if not beats or beat_period <= 0:
+        return 0.0
+    _, dist = _nearest(t, beats)
+    # normalize by half a beat — anything beyond that is "maximally off-beat"
+    return min(1.0, dist / max(0.001, beat_period * 0.5))
+
+
+def _vocal_cut_penalty(t: float, vocal_intervals: list[dict]) -> float:
+    """1.0 if the cut lands inside a sung phrase, 0.0 otherwise."""
+    return 1.0 if _interval_contains(vocal_intervals, t) is not None else 0.0
+
+
 def transition_penalty(analysis: dict, start: float, end: float) -> float:
+    """Higher = more audible cut. Combines envelope discontinuity (existing signals),
+    beat-phase alignment (cuts off the beat are very audible), and vocal intrusion
+    (cuts through a sung phrase are maximally audible)."""
     energy_curve = analysis.get("energy_curve", [])
     onset_curve = analysis.get("onset_curve", [])
     brightness_curve = analysis.get("brightness_curve", [])
+    duration = float(analysis.get("duration_sec") or 0.0) or (end + 4.0)
     left_energy = average_curve(energy_curve, max(0.0, start - 4.0), start)
-    right_energy = average_curve(energy_curve, end, min(analysis["duration_sec"], end + 4.0))
+    right_energy = average_curve(energy_curve, end, min(duration, end + 4.0))
     left_onset = average_curve(onset_curve, max(0.0, start - 4.0), start)
-    right_onset = average_curve(onset_curve, end, min(analysis["duration_sec"], end + 4.0))
+    right_onset = average_curve(onset_curve, end, min(duration, end + 4.0))
     left_bright = average_curve(brightness_curve, max(0.0, start - 4.0), start)
-    right_bright = average_curve(brightness_curve, end, min(analysis["duration_sec"], end + 4.0))
-    return round(abs(left_energy - right_energy) * 0.55 + abs(left_onset - right_onset) * 0.25 + abs(left_bright - right_bright) * 0.2, 3)
+    right_bright = average_curve(brightness_curve, end, min(duration, end + 4.0))
+    envelope = (
+        abs(left_energy - right_energy) * 0.40
+        + abs(left_onset - right_onset) * 0.20
+        + abs(left_bright - right_bright) * 0.15
+    )
+
+    beats = analysis.get("beat_times") or []
+    tempo = float(analysis.get("tempo_bpm") or 0.0)
+    beat_period = 60.0 / tempo if tempo > 0 else 0.5
+    phase = (_beat_phase_penalty(start, beats, beat_period) + _beat_phase_penalty(end, beats, beat_period)) * 0.5
+
+    vocals = analysis.get("likely_vocal_intervals") or []
+    voc = (_vocal_cut_penalty(start, vocals) + _vocal_cut_penalty(end, vocals)) * 0.5
+
+    return round(envelope + phase * 0.30 + voc * 0.40, 3)
 
 
 def build_cut_candidates(analysis: dict, target_sec: float, aggressiveness: int = 50) -> list[dict]:
@@ -655,6 +1139,8 @@ def build_cut_candidates(analysis: dict, target_sec: float, aggressiveness: int 
         return []
 
     boundaries = list(analysis.get("section_boundaries", []))
+    beats = list(analysis.get("beat_times", []))
+    vocals = list(analysis.get("likely_vocal_intervals", []))
     anchors = [0.0, *boundaries, duration]
     opening_guard = min(20.0, max(10.0, duration * 0.08))
     ending_guard = min(25.0, max(12.0, duration * 0.10))
@@ -663,8 +1149,10 @@ def build_cut_candidates(analysis: dict, target_sec: float, aggressiveness: int 
     candidates: list[dict] = []
 
     for i in range(len(anchors) - 1):
-        start = float(anchors[i])
-        end = float(anchors[i + 1])
+        raw_start = float(anchors[i])
+        raw_end = float(anchors[i + 1])
+        start = _align_boundary(raw_start, boundaries, beats, vocals, duration)
+        end = _align_boundary(raw_end, boundaries, beats, vocals, duration)
         seg_len = end - start
         if seg_len < max(6.0, phrase_grid * 0.75):
             continue
@@ -696,8 +1184,8 @@ def build_cut_candidates(analysis: dict, target_sec: float, aggressiveness: int 
     for b0, b1 in zip(anchors[:-1], anchors[1:]):
         if b1 - b0 < window + phrase_grid:
             continue
-        start = snap_to_boundaries(b0 + phrase_grid, boundaries, duration, tolerance=0.75)
-        end = snap_to_boundaries(min(b1 - phrase_grid, start + window), boundaries, duration, tolerance=0.75)
+        start = _align_boundary(b0 + phrase_grid, boundaries, beats, vocals, duration)
+        end = _align_boundary(min(b1 - phrase_grid, start + window), boundaries, beats, vocals, duration)
         if end - start < max(6.0, phrase_grid * 0.75):
             continue
         if start < opening_guard or end > duration - ending_guard:
@@ -759,40 +1247,53 @@ def build_music_edit_prompt(analysis: dict, target_sec: float, discipline: str, 
         }
         for c in analysis.get("local_candidates", [])[:8]
     ]
-    return f"""You are an elite figure-skating music editor. You are receiving the actual audio file, plus local structure analysis generated from signal processing. Build strong cut plans that preserve musical phrasing, momentum, climax, and skateability.
+    beat_period = round(60.0 / max(60.0, float(analysis.get('tempo_bpm') or 120.0)), 3)
+    # Keep the prompt compact: 40 beats and 24 downbeats is enough for the model
+    # to understand the grid; tempo lets it extrapolate the rest, and beyond this
+    # the extra tokens slow inference without improving cut quality.
+    beats_preview = (analysis.get('beat_times') or [])[:40]
+    downbeats_preview = (analysis.get('downbeat_times') or [])[:24]
+    return f"""You are an elite figure-skating music editor. The top priority is that edits are INAUDIBLE — a listener who has never heard the original track should not be able to tell where the cuts are. You receive the actual audio plus local signal-processing analysis. Build cut plans that preserve phrasing, momentum, and climax, and place every cut boundary on a musically safe join.
 
 TASK:
 - Current duration: {duration:.1f} seconds
 - Target duration: {target_sec:.1f} seconds
 - Need to remove about: {needed_cut:.1f} seconds
-- Requested style: {program_style}
+- Requested style: {program_style} — {style_description(program_style)}
 - Aggressiveness: {aggressiveness}/100
 - Return exactly {num_options} ranked edit plans
 {discipline_line}
 LOCAL ANALYSIS SUMMARY:
-- Tempo BPM: {analysis['tempo_bpm']}
+- Tempo BPM: {analysis['tempo_bpm']} (one beat ≈ {beat_period}s)
 - Phrase grid seconds: {analysis.get('phrase_grid_sec')}
 - Section boundaries: {analysis.get('section_boundaries', [])}
 - Estimated climax time: {analysis.get('estimated_climax_time')}
 - Estimated key/mode: {analysis.get('estimated_key', {}).get('label')} (confidence {analysis.get('estimated_key', {}).get('confidence')})
 - Chord-change density per minute: {analysis.get('chord_change_density_per_min')}
-- Likely vocal intervals: {analysis.get('likely_vocal_intervals', [])[:12]}
+- Likely vocal intervals (DO NOT cut inside these): {analysis.get('likely_vocal_intervals', [])[:20]}
+- Beat grid (first 180 beats): {beats_preview}
+- Downbeat grid (assumed 4/4, first 60 bar-starts — prefer these for cut boundaries): {downbeats_preview}
 - Energy curve: {analysis.get('energy_curve', [])}
 - Onset/activity curve: {analysis.get('onset_curve', [])}
 - Brightness curve: {analysis.get('brightness_curve', [])}
 - Chord-change curve: {analysis.get('chord_change_curve', [])}
 - Vocal-presence curve: {analysis.get('vocal_presence_curve', [])}
-- Low-risk local cut candidates: {candidate_preview}
+- Low-risk local cut candidates (already snapped to section + beat + vocal-safe): {candidate_preview}
 
-REQUIREMENTS:
-1. Listen to the actual audio, not just the local analysis. Use what you hear to detect repeated material, lyrical transitions, orchestral swells, drops, cadence points, and whether joins will feel natural.
+CUT ALIGNMENT RULES (hard):
+A. Every cut boundary MUST land on a downbeat (preferred) or at minimum on a beat. If you cannot justify the exact position in terms of the beat/downbeat grid, pick a nearby grid point instead.
+B. NO cut boundary may fall inside a listed vocal interval. A boundary must be in an instrumental moment — either before the vocal phrase starts or after it ends. If that forces the plan to remove less than the target, take it: a short plan that never cuts through a lyric beats a tight plan that does.
+C. Match context across the join: the bar-count, metric feel, and harmonic context (the chord-change curve) should be similar immediately before the cut-out point and immediately after the cut-in point. A verse cannot be stitched to a bridge unless the chord/tempo context matches at the seam.
+D. Where possible, cut "between rhymes": out at the end of one lyric/phrase, back in at the start of the equivalent position of the next phrase — NOT one bar earlier, not one bar later. This is the single biggest reason edits sound invisible.
+E. Crossfades of 150-400ms are available, but they do NOT fix a cut that lands mid-word or mid-beat — treat the crossfade as polish on an already-correct cut, not a fix.
+
+OTHER REQUIREMENTS:
+1. Listen to the actual audio. Detect repeated material (verse 1 ≈ verse 2 ⇒ safe to drop one), orchestral swells, drops, cadence points, and whether a seam will feel natural.
 2. Preserve a coherent opening and the final payoff. Do not cut away the ending climax unless the audio clearly supports that.
-3. Prefer cut boundaries near section or phrase changes unless there is a compelling musical reason not to.
-4. Keep cuts non-overlapping and inside the track.
-5. Each plan must be realistically editable with standard crossfades.
-6. Favor plans that keep the emotional arc intact for figure skating performance.
-7. If vocals or narrative cues make a candidate cut awkward, say so and avoid it.
-8. Total removed time for each plan should land within ±3 seconds of the target unless the track makes that impossible.
+3. Keep cuts non-overlapping and inside the track.
+4. Favor plans that keep the emotional arc intact for figure skating performance.
+5. Total removed time for each plan should land within ±3 seconds of the target, unless an audible cut is the only way — quality of the seam always beats hitting the second exactly.
+6. In each cut's "reason" field, briefly cite the alignment: which downbeat it snaps to and which phrase you are joining to which. This forces your own checking.
 
 Return JSON only, no markdown fences:
 {{
@@ -826,9 +1327,27 @@ def parse_json_object(text: str) -> dict:
         return json.loads(m.group(0))
 
 
+def _align_boundary(
+    t: float,
+    boundaries: list[float],
+    beats: list[float],
+    vocals: list[dict],
+    duration: float,
+) -> float:
+    """Run a cut boundary through the full alignment pipeline:
+    section-snap -> beat-snap -> vocal-escape -> beat-resnap. This is used for
+    both AI-proposed cuts and locally-generated candidate cuts so they converge
+    on the same set of musically-safe positions."""
+    aligned = snap_to_grid(t, boundaries, beats, duration)
+    aligned = avoid_vocal(aligned, vocals, beats, boundaries, duration)
+    return aligned
+
+
 def sanitize_cut_list(cuts: list, analysis: dict) -> list[dict]:
     duration = float(analysis["duration_sec"])
     boundaries = list(analysis.get("section_boundaries", []))
+    beats = list(analysis.get("beat_times", []))
+    vocals = list(analysis.get("likely_vocal_intervals", []))
     valid = []
     for c in cuts or []:
         try:
@@ -838,9 +1357,9 @@ def sanitize_cut_list(cuts: list, analysis: dict) -> list[dict]:
             continue
         if e <= s:
             continue
-        s = snap_to_boundaries(s, boundaries, duration, tolerance=0.75)
-        e = snap_to_boundaries(e, boundaries, duration, tolerance=0.75)
-        if e <= s:
+        s = _align_boundary(s, boundaries, beats, vocals, duration)
+        e = _align_boundary(e, boundaries, beats, vocals, duration)
+        if e <= s + 0.1:
             continue
         valid.append({
             "start": round(s, 2),
@@ -911,6 +1430,140 @@ def ai_suggest_cuts_with_gemini(src_path: Path, analysis: dict, target_sec: floa
     )
     parsed = parse_json_object(response.text or "")
     return normalize_plan_response(parsed, analysis, GEMINI_MODEL, "gemini")
+
+
+def build_audition_optimize_prompt(
+    analysis: dict,
+    original_plan: dict,
+    target_sec: float,
+    discipline: str,
+    program_style: str,
+    aggressiveness: int,
+) -> str:
+    """Prompt that asks Gemini to LISTEN to a rendered audition preview, detect
+    audible seams, and emit a refined cut list in the source timeline. The model
+    does not receive the source audio again — the analysis summary captures its
+    structure, and the audition is what needs critique."""
+    duration = float(analysis.get("duration_sec") or 0.0)
+    beat_period = round(60.0 / max(60.0, float(analysis.get("tempo_bpm") or 120.0)), 3)
+    beats_preview = (analysis.get("beat_times") or [])[:40]
+    downbeats_preview = (analysis.get("downbeat_times") or [])[:24]
+    vocals = (analysis.get("likely_vocal_intervals") or [])[:20]
+    original_cuts = [
+        {
+            "index": i + 1,
+            "start": round(float(c.get("start", 0.0)), 2),
+            "end": round(float(c.get("end", 0.0)), 2),
+            "reason": str(c.get("reason") or "")[:200],
+        }
+        for i, c in enumerate(original_plan.get("cuts") or [])
+    ]
+    original_removed = round(
+        sum(max(0.0, c["end"] - c["start"]) for c in original_cuts), 2,
+    )
+    target_remove_sec = round(max(0.0, duration - target_sec), 2)
+    discipline_line = f"Skating discipline / context: {discipline}\n" if discipline else ""
+    return f"""You are listening to a RENDERED PREVIEW of an edited figure-skating program. Your job is to identify AUDIBLE edit seams — places where the listener can tell a cut happened — and propose a refined cut list that eliminates them.
+
+CUT SEMANTICS (CRITICAL — READ FIRST):
+A "cut" is a REGION TO REMOVE from the source track. Each entry `{{"start": S, "end": E}}` means the audio between S and E is DELETED. The final program equals the source track with every cut region removed, joined with crossfades.
+- Source track duration: {duration:.2f}s
+- Target program duration: {target_sec:.1f}s
+- Therefore total time to REMOVE (sum of all (end - start) across your cuts) must be ≈ {target_remove_sec:.1f}s.
+- The ORIGINAL plan removes {original_removed:.1f}s across {len(original_cuts)} cut region(s).
+- DO NOT return "keep" ranges. Returning cuts that sum to {target_sec:.1f}s (the target length) means you inverted the semantics and the output will be almost entirely deleted.
+
+AUDIBLE-SEAM CHECKLIST (listen for these in the preview):
+- Cuts that land off-beat (the grid skips or "trips").
+- Cuts that sever a vocal phrase (word or syllable truncated).
+- Key or mode jumps across the seam (chord A → unrelated chord B).
+- Dynamics / reverb-tail mismatches (loud to quiet, long reverb to dry).
+- Crossfade that sounds "smeared" because two different beats are overlapping.
+
+WHAT YOU RECEIVE:
+- The audition preview as the attached audio. This preview has already had the original cut regions removed, crossfaded, and faded. Any audible seam you hear in this preview is a join the original cuts created.
+- The ORIGINAL cut plan (the list of regions that were removed) below. Cut indices (1-based) refer to these.
+- Structural context from the SOURCE timeline: tempo, beat grid, section boundaries, vocal intervals, key estimate. All cut times in your response MUST be in the source timeline, NOT the audition's compressed timeline.
+
+SOURCE TIMELINE CONTEXT:
+- Duration: {duration:.2f}s
+- Tempo BPM: {analysis.get('tempo_bpm')} (one beat ≈ {beat_period}s)
+- Section boundaries: {analysis.get('section_boundaries', [])}
+- Estimated key/mode: {analysis.get('estimated_key', {}).get('label')} (confidence {analysis.get('estimated_key', {}).get('confidence')})
+- Likely vocal intervals (DO NOT place cut boundaries inside these): {vocals}
+- First 40 beats: {beats_preview}
+- First 24 downbeats (preferred cut landing points): {downbeats_preview}
+
+ORIGINAL CUT PLAN (regions that were REMOVED; cut indices 1-based; times are source-timeline seconds):
+{original_cuts}
+
+TARGET:
+- Target program duration: {target_sec:.1f}s
+- Total to remove (budget): {target_remove_sec:.1f}s ± 3s
+- Aggressiveness: {aggressiveness}/100
+- Style: {program_style} — {style_description(program_style)}
+{discipline_line}
+RULES FOR THE REFINED PLAN:
+1. Return a COMPLETE list of REMOVE regions in source-timeline seconds (not deltas). A refined plan replaces the original plan wholesale. Each region's (end - start) is the duration that gets deleted.
+2. The sum of all (end - start) values in your `cuts` array MUST be approximately {target_remove_sec:.1f}s (±3s). If your sum is closer to {target_sec:.1f}s, you inverted the semantics — re-read CUT SEMANTICS above.
+3. Every cut boundary MUST land on a downbeat if possible, otherwise on a beat. NO boundary may fall inside a listed vocal interval.
+4. Cut regions must not overlap, and must stay within [0, {duration:.2f}].
+5. If the preview sounds CLEAN (no audible seams), return the ORIGINAL cuts unchanged with confidence ≥ 0.9 and an empty `changes` array. Do not invent problems. The original cuts removed {original_removed:.1f}s total.
+6. If you move a cut, explain in `changes` which cut index you moved and why (e.g. "cut #2 was mid-vocal at 63.1s; moved start to downbeat 65.27s to clear the phrase").
+7. Do NOT add new cut regions just to hit the budget exactly. Quality of seams beats matching duration exactly.
+
+Return JSON only (no markdown fences):
+{{
+  "title": "short descriptive label — 'Refined: <what you changed>' or 'Unchanged: clean'",
+  "summary": "one sentence on the audible verdict",
+  "confidence": 0.0,
+  "transition_risk": "low|medium|high",
+  "changes": ["cut #2 start shifted +1.3s to downbeat 65.27s to clear vocal"],
+  "cuts": [
+    {{"start": 0.0, "end": 0.0, "reason": "what audible problem this removal avoids or resolves"}}
+  ]
+}}"""
+
+
+def ai_optimize_audition_with_gemini(
+    audition_path: Path,
+    analysis: dict,
+    original_plan: dict,
+    target_sec: float,
+    discipline: str = "",
+    program_style: str = "balanced",
+    aggressiveness: int = 50,
+) -> dict:
+    """Send the rendered audition preview + textual context to Gemini, return a
+    refined plan dict. Caller is responsible for running the returned cut list
+    through `sanitize_cut_list` before rendering."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as e:
+        raise RuntimeError("google-genai SDK not installed. Run: pip install google-genai") from e
+
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY env var is not set. Add a Gemini API key to use audition optimization.")
+
+    client = genai.Client()
+    prompt = build_audition_optimize_prompt(
+        analysis=analysis,
+        original_plan=original_plan,
+        target_sec=target_sec,
+        discipline=discipline,
+        program_style=program_style,
+        aggressiveness=aggressiveness,
+    )
+    audio_part = types.Part.from_bytes(
+        data=audition_path.read_bytes(),
+        mime_type=guess_audio_mime(audition_path),
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[audio_part, prompt],
+    )
+    return parse_json_object(response.text or "")
 
 
 def ai_suggest_cuts_with_claude_fallback(analysis: dict, target_sec: float, discipline: str = "", program_style: str = "balanced", aggressiveness: int = 50, num_options: int = 3) -> dict:

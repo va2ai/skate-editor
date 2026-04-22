@@ -43,7 +43,16 @@
     letter-spacing: -0.02em; }
   h1 em { font-style: italic; color: var(--ice); font-weight: 500; }
   .tagline { color: var(--ink-dim); font-size: 13px; letter-spacing: 0.05em;
-    text-transform: uppercase; }
+    text-transform: uppercase; text-align: right; }
+  .build-pill { margin-top: 6px; font-size: 10px; color: var(--ink-faint);
+    letter-spacing: 0.04em; text-align: right; }
+  .build-pill code { background: var(--bg-elev); padding: 2px 6px;
+    border-radius: 999px; border: 1px solid var(--line); color: var(--ink-dim);
+    font-family: 'Manrope', monospace; font-size: 10px; }
+  .dl-source { display: inline-block; margin-left: 8px; font-size: 11px;
+    color: var(--ice); text-decoration: none; padding: 2px 8px;
+    border: 1px solid var(--line); border-radius: 999px; }
+  .dl-source:hover { border-color: var(--ice); background: rgba(127,219,255,0.06); }
 
   .card { background: var(--bg-card); border: 1px solid var(--line); border-radius: 12px;
     padding: 28px; margin-bottom: 20px; }
@@ -59,6 +68,21 @@
   .upload-zone .label { font-size: 16px; color: var(--ink); margin-bottom: 6px; }
   .upload-zone .hint { font-size: 12px; color: var(--ink-faint); }
   #fileInput { display: none; }
+
+  .tab-bar { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--line); }
+  .tab-bar .tab { background: transparent; border: none; border-bottom: 2px solid transparent;
+    color: var(--ink-dim); padding: 10px 18px; font-size: 13px; font-weight: 500;
+    cursor: pointer; letter-spacing: 0.02em; border-radius: 0; transition: all 0.15s; }
+  .tab-bar .tab:hover { color: var(--ink); }
+  .tab-bar .tab.active { color: var(--ice); border-bottom-color: var(--ice); }
+  .url-row { display: flex; gap: 10px; align-items: stretch; }
+  .url-row input[type="url"] { flex: 1; padding: 14px 16px; background: var(--bg-elev);
+    color: var(--ink); border: 1px solid var(--line); border-radius: 8px;
+    font-family: inherit; font-size: 14px; }
+  .url-row input[type="url"]:focus { outline: none; border-color: var(--ice); }
+  .url-status { margin-top: 12px; color: var(--ink-dim); font-size: 13px;
+    display: flex; align-items: center; gap: 10px; }
+  .url-hint { margin-top: 14px; color: var(--ink-faint); font-size: 12px; line-height: 1.6; }
 
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
     background: var(--line); border-radius: 12px; overflow: hidden; margin-bottom: 20px; }
@@ -222,17 +246,41 @@
 
   <header>
     <h1>Skating Music <em>Editor</em></h1>
-    <div class="tagline">Cut · Crossfade · AI · Export</div>
+    <div>
+      <div class="tagline">Cut · Crossfade · AI · Export</div>
+      <div class="build-pill" title="Server build id — if this doesn't change after a hard reload, you're seeing a cached page">
+        build <code id="buildId">{{ build_id }}</code>
+      </div>
+    </div>
   </header>
 
   <!-- Step 1: Upload -->
   <div class="card" id="uploadCard">
-    <label class="upload-zone" id="uploadZone" for="fileInput">
-      <div class="icon">+</div>
-      <div class="label">Drop an audio file here or click to browse</div>
-      <div class="hint">MP3 · WAV · M4A · FLAC · OGG · max 50MB</div>
-    </label>
-    <input type="file" id="fileInput" accept="audio/*" />
+    <div class="tab-bar" role="tablist">
+      <button class="tab active" data-tab="file" role="tab" type="button">Upload file</button>
+      <button class="tab" data-tab="url" role="tab" type="button">From URL</button>
+    </div>
+
+    <div class="tab-panel" data-panel="file">
+      <label class="upload-zone" id="uploadZone" for="fileInput">
+        <div class="icon">+</div>
+        <div class="label">Drop an audio file here or click to browse</div>
+        <div class="hint">MP3 · WAV · M4A · FLAC · OGG · max 50MB</div>
+      </label>
+      <input type="file" id="fileInput" accept="audio/*" />
+    </div>
+
+    <div class="tab-panel hidden" data-panel="url">
+      <div class="url-row">
+        <input type="url" id="urlInput" placeholder="https://www.youtube.com/watch?v=…" />
+        <button class="primary" id="urlFetchBtn" type="button">Fetch</button>
+      </div>
+      <div class="url-status" id="urlStatus"></div>
+      <div class="url-hint">
+        Paste a YouTube or other supported video URL — the audio is extracted to MP3.
+        Max video length 20 min · max file size 50 MB · may take up to a minute.
+      </div>
+    </div>
   </div>
 
   <!-- Step 2: Editor -->
@@ -242,7 +290,10 @@
       <div class="stat">
         <div class="k">Original</div>
         <div class="v" id="statOrig">—</div>
-        <div class="sub" id="statOrigName">—</div>
+        <div class="sub">
+          <span id="statOrigName">—</span>
+          <a id="dlSourceLink" class="dl-source hidden" href="#" download>↓ source</a>
+        </div>
       </div>
       <div class="stat">
         <div class="k">Cut</div>
@@ -313,6 +364,7 @@
             <option value="technical">Technical</option>
             <option value="aggressive">Aggressive</option>
           </select>
+          <div class="sub" id="aiStyleHint" style="margin-top:6px; color: var(--ink-faint); font-size: 12px; line-height: 1.4;"></div>
         </div>
         <div class="field">
           <label>AI provider</label>
@@ -339,6 +391,19 @@
           Preferred: <code>GEMINI_API_KEY</code> for full audio understanding. Optional fallback: <code>ANTHROPIC_API_KEY</code> for feature-only planning.
         </p>
       </div>
+    </div>
+
+    <!-- Auditions -->
+    <div class="card hidden" id="auditionPanel">
+      <h2 class="section-title">
+        Auditions
+        <small>preview AI plans before committing</small>
+      </h2>
+      <div class="controls">
+        <button class="ai" id="renderBestAuditionBtn" type="button">Render best plan</button>
+        <button id="renderAllAuditionsBtn" type="button">Render all plans</button>
+      </div>
+      <div id="auditionResult"></div>
     </div>
 
     <!-- Cut regions -->
@@ -444,6 +509,32 @@ input.addEventListener('change', () => {
   if (input.files.length) handleUpload(input.files[0]);
 });
 
+document.querySelectorAll('.tab-bar .tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const target = btn.dataset.tab;
+    document.querySelectorAll('.tab-bar .tab').forEach(t =>
+      t.classList.toggle('active', t === btn));
+    document.querySelectorAll('.tab-panel').forEach(p =>
+      p.classList.toggle('hidden', p.dataset.panel !== target));
+  });
+});
+
+function onUploadSuccess(j) {
+  state.fileId = j.file_id;
+  state.ext = j.ext;
+  state.duration = j.duration_sec;
+  state.originalName = j.original_name;
+  $('uploadCard').classList.add('hidden');
+  $('editor').classList.remove('hidden');
+  $('statOrig').textContent = fmt(state.duration);
+  $('statOrigName').textContent = state.originalName;
+  const dl = $('dlSourceLink');
+  dl.href = `/download_source/${state.fileId}.${state.ext}?name=${encodeURIComponent(state.originalName || '')}`;
+  dl.classList.remove('hidden');
+  initWaveform();
+  toast('Loaded — drag to mark cuts, or use AI suggestions below', 'success');
+}
+
 async function handleUpload(file) {
   const fd = new FormData();
   fd.append('file', file);
@@ -452,18 +543,42 @@ async function handleUpload(file) {
     const r = await fetch('/upload', { method: 'POST', body: fd });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || 'upload failed');
-    state.fileId = j.file_id;
-    state.ext = j.ext;
-    state.duration = j.duration_sec;
-    state.originalName = j.original_name;
-    $('uploadCard').classList.add('hidden');
-    $('editor').classList.remove('hidden');
-    $('statOrig').textContent = fmt(state.duration);
-    $('statOrigName').textContent = state.originalName;
-    initWaveform();
-    toast('Loaded — drag to mark cuts, or use AI suggestions below', 'success');
+    onUploadSuccess(j);
   } catch (e) { toast(e.message, 'error'); }
 }
+
+async function handleUrlFetch() {
+  const url = $('urlInput').value.trim();
+  if (!url) { toast('Paste a URL first', 'error'); return; }
+  const btn = $('urlFetchBtn');
+  const status = $('urlStatus');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'Fetching…';
+  status.innerHTML = '<div class="spinner"></div><div>Downloading and extracting audio… this can take up to a minute.</div>';
+  try {
+    const r = await fetch('/download_url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'download failed');
+    status.innerHTML = '';
+    onUploadSuccess(j);
+  } catch (e) {
+    status.innerHTML = '';
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+
+$('urlFetchBtn').addEventListener('click', handleUrlFetch);
+$('urlInput').addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') { ev.preventDefault(); handleUrlFetch(); }
+});
 
 // ───────── Waveform ─────────
 function initWaveform() {
@@ -584,6 +699,47 @@ $('aiTargetLen').addEventListener('change', () => refreshCuts());
 $('aiAggressiveness').addEventListener('input', updateAggroLabel);
 updateAggroLabel();
 
+// Short descriptions for each AI style. The label in the dropdown conveys the
+// vibe; this hint explains what the AI will actually prioritize when cutting.
+// Keep in sync with STYLE_DESCRIPTIONS in app.py (same keys, same wording).
+const AI_STYLE_HINTS = {
+  balanced: 'Default — even mix of rhythmic coherence, vocal phrasing, and emotional arc. No single priority dominates.',
+  dramatic: 'Prioritizes big moments — climaxes, drops, key changes. Willing to accept slightly rougher joins if they land on a peak.',
+  lyrical: 'Preserves vocal phrases and melodic lines. Gentler transitions, fewer cuts mid-phrase, more on-breath edits.',
+  technical: 'Tight on-beat/downbeat joins and rhythmic coherence. Skating-grid friendly; prioritizes predictable pulse over emotion.',
+  aggressive: 'Bigger removals, willing to skip whole sections for pace. Favors high-energy material; drops softer bridges and intros.',
+};
+function updateStyleHint() {
+  const el = $('aiStyleHint');
+  if (!el) return;
+  el.textContent = AI_STYLE_HINTS[$('aiStyle').value] || '';
+}
+$('aiStyle').addEventListener('change', updateStyleHint);
+updateStyleHint();
+
+// Stale-cache detector: the build id baked into this HTML came from whatever
+// version of the server rendered the page. If the running server now reports
+// a different id, the browser is serving a cached copy and the JS may be out
+// of sync with the backend. Flag it visibly so we don't waste time debugging
+// phantom errors.
+(async () => {
+  try {
+    const r = await fetch('/build_id', { cache: 'no-store' });
+    if (!r.ok) return;
+    const { build_id: serverId } = await r.json();
+    const pageId = $('buildId')?.textContent?.trim();
+    if (!pageId || !serverId || pageId === serverId) return;
+    const el = $('buildId');
+    if (el) {
+      el.textContent = `${pageId} ⚠ server=${serverId}`;
+      el.style.background = 'rgba(255, 85, 119, 0.18)';
+      el.style.borderColor = 'var(--cut)';
+      el.style.color = '#ffb2c1';
+    }
+    toast('Stale page — hard-reload (Ctrl+Shift+R) to match the running server', 'error');
+  } catch {}
+})();
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
@@ -603,7 +759,8 @@ $('aiBtn').addEventListener('click', async () => {
   $('aiResult').innerHTML = `
     <div class="ai-loading">
       <div class="spinner"></div>
-      <div>Running multimodal audio analysis + structure verification…<br>
+      <div>
+        <span id="aiStatusText">Running multimodal audio analysis + structure verification…</span><br>
         <span style="font-size: 12px; color: var(--ink-faint);">
           returns ranked edit plans with confidence, transition risk, and audio-aware cut reasoning
         </span>
@@ -625,9 +782,50 @@ $('aiBtn').addEventListener('click', async () => {
         ai_provider: $('aiProvider').value,
       }),
     });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || 'analysis failed');
+    if (!r.ok) {
+      let errMsg = 'analysis failed';
+      try { errMsg = (await r.json()).error || errMsg; } catch {}
+      throw new Error(errMsg);
+    }
 
+    // /analyze streams NDJSON: {type:"status"|"heartbeat"|"result"|"error"}.
+    // This keeps the connection warm during the 60-120s Gemini call.
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let finalResult = null;
+    let streamError = null;
+    const updateStatus = (text) => {
+      const el = $('aiStatusText');
+      if (el) el.textContent = text;
+    };
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === 'status') {
+          if (ev.stage === 'analyzing_audio') updateStatus('Running local structure analysis…');
+          else if (ev.stage === 'asking_ai') updateStatus(`Asking ${ev.provider || 'AI'} to score cuts (60–120s is normal)…`);
+        } else if (ev.type === 'heartbeat') {
+          updateStatus(`AI still working… ${Math.round(ev.elapsed || 0)}s elapsed`);
+        } else if (ev.type === 'error') {
+          streamError = ev.error || 'analysis failed';
+        } else if (ev.type === 'result') {
+          finalResult = ev;
+        }
+      }
+    }
+    if (streamError) throw new Error(streamError);
+    if (!finalResult) throw new Error('analysis ended without a result (connection closed early)');
+
+    const j = finalResult;
     state.sectionBoundaries = j.analysis.section_boundaries || [];
     state.aiSuggestion = j.suggestion;
 
@@ -854,34 +1052,164 @@ async function renderAuditions(plans) {
   }
 }
 
+// output_id -> audition entry; lets the optimize handler reconstruct a plan's
+// cut list without re-fetching from state.aiSuggestion (optimized cards are
+// not in aiSuggestion at all).
+const auditionsById = new Map();
+
+function renderAuditionCardHtml(a, idx) {
+  if (a.error) {
+    return `<div class="audition-card"><div class="plan-title">${escapeHtml(a.title || `Plan ${idx + 1}`)}</div><div class="warn">${escapeHtml(a.error)}</div></div>`;
+  }
+  const originPill = a.origin
+    ? `<span class="plan-pill" style="border-color: var(--ai); color: var(--ai);">↻ optimized from: ${escapeHtml(a.origin.optimized_from_title || 'plan')}</span>`
+    : '';
+  const changes = (a.changes || []).length
+    ? `<div class="mini-candidates"><b>AI adjustments:</b> ${a.changes.map(c => `<code>${escapeHtml(c)}</code>`).join(' · ')}</div>`
+    : '';
+  return `<div class="audition-card" data-output-id="${a.output_id}">
+    <div class="plan-head">
+      <div class="plan-title">${escapeHtml(a.title || `Plan ${idx + 1}`)}</div>
+      ${originPill}
+    </div>
+    <div class="plan-summary">${escapeHtml(a.summary || '')}</div>
+    <div class="audition-meta">
+      <span class="plan-pill">${fmt(a.duration_sec)}</span>
+      <span class="plan-pill">${escapeHtml(String(Math.round((a.size_bytes || 0) / 1024)))} KB</span>
+      <span class="plan-pill">${escapeHtml((a.format || '').toUpperCase())}</span>
+    </div>
+    <audio controls preload="none" src="${a.preview_url}"></audio>
+    <div class="audition-actions">
+      <a class="download-link" href="${a.download_url}" download>Download audition</a>
+      <button class="ai optimizeAuditionBtn" type="button" data-output-id="${a.output_id}" data-format="${a.format || 'mp3'}">✨ Optimize with AI</button>
+    </div>
+    ${changes}
+    <div class="audition-status" data-for-output="${a.output_id}"></div>
+  </div>`;
+}
+
+function wireAuditionButtons() {
+  document.querySelectorAll('.optimizeAuditionBtn').forEach(btn => {
+    if (btn._wired) return;
+    btn._wired = true;
+    btn.addEventListener('click', () => handleOptimizeAudition(btn));
+  });
+}
+
 function drawAuditions(auditions) {
   if (!auditions.length) {
     $('auditionResult').innerHTML = `<div class="ai-empty">No auditions were rendered.</div>`;
     return;
   }
-  $('auditionResult').innerHTML = `<div class="audition-grid">${auditions.map((a, idx) => {
-    if (a.error) {
-      return `<div class="audition-card"><div class="plan-title">${escapeHtml(a.title || `Plan ${idx + 1}`)}</div><div class="warn">${escapeHtml(a.error)}</div></div>`;
-    }
-    return `<div class="audition-card">
-      <div class="plan-head">
-        <div class="plan-title">${escapeHtml(a.title || `Plan ${idx + 1}`)}</div>
-      </div>
-      <div class="plan-summary">${escapeHtml(a.summary || '')}</div>
-      <div class="audition-meta">
-        <span class="plan-pill">${fmt(a.duration_sec)}</span>
-        <span class="plan-pill">${escapeHtml(String(Math.round((a.size_bytes || 0) / 1024)))} KB</span>
-        <span class="plan-pill">${escapeHtml((a.format || '').toUpperCase())}</span>
-      </div>
-      <audio controls preload="none" src="${a.preview_url}"></audio>
-      <div class="audition-actions">
-        <a class="download-link" href="${a.download_url}" download>Download audition</a>
-      </div>
-    </div>`;
-  }).join('')}</div>`;
+  auditions.forEach(a => { if (a.output_id) auditionsById.set(a.output_id, a); });
+  $('auditionResult').innerHTML = `<div class="audition-grid">${auditions.map((a, idx) => renderAuditionCardHtml(a, idx)).join('')}</div>`;
+  wireAuditionButtons();
 }
 
-$('renderBestAuditionBtn').addEventListener('click', () => {
+function appendAuditionCard(a) {
+  if (a.output_id) auditionsById.set(a.output_id, a);
+  const grid = document.querySelector('#auditionResult .audition-grid');
+  if (!grid) { drawAuditions([a]); return; }
+  const tmp = document.createElement('div');
+  tmp.innerHTML = renderAuditionCardHtml(a, grid.children.length);
+  const card = tmp.firstElementChild;
+  if (card) grid.appendChild(card);
+  wireAuditionButtons();
+}
+
+async function handleOptimizeAudition(btn) {
+  const outputId = btn.dataset.outputId;
+  const a = auditionsById.get(outputId);
+  if (!a) { toast('Audition data missing — re-render to retry', 'error'); return; }
+  const target = parseFloat($('aiTargetLen').value);
+  if (!target) { toast('Pick a target length first', 'error'); return; }
+
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = '✨ Optimizing…';
+  const statusEl = document.querySelector(`.audition-status[data-for-output="${outputId}"]`);
+  const setStatus = (text, kind) => {
+    if (!statusEl) return;
+    if (!text) { statusEl.innerHTML = ''; return; }
+    const color = kind === 'error' ? 'color: var(--cut);' : 'color: var(--ink-dim);';
+    statusEl.innerHTML = `<div style="${color} font-size: 12px; margin-top: 8px;">${escapeHtml(text)}</div>`;
+  };
+  setStatus('Asking gemini…');
+
+  try {
+    const res = await fetch('/optimize_audition', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_id: state.fileId,
+        ext: state.ext,
+        audition_output_id: outputId,
+        audition_format: a.format || 'mp3',
+        original_plan: { title: a.title, cuts: a.cuts || [] },
+        target_sec: target,
+        discipline: $('aiDiscipline').value || '',
+        program_style: $('aiStyle').value,
+        aggressiveness: parseInt($('aiAggressiveness').value || '50', 10),
+        render_opts: {
+          crossfade_ms: parseInt($('crossfadeMs').value || '250', 10),
+          fade_in_ms: parseInt($('fadeInMs').value || '100', 10),
+          fade_out_ms: parseInt($('fadeOutMs').value || '2000', 10),
+          target_format: $('targetFormat').value,
+          bitrate: $('bitrate').value,
+        },
+      }),
+    });
+    if (!res.ok) {
+      let err = 'optimize failed';
+      try { err = (await res.json()).error || err; } catch {}
+      throw new Error(err);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let finalResult = null;
+    let streamError = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === 'status') {
+          if (ev.stage === 'asking_ai') setStatus(`Asking ${ev.provider || 'AI'} to critique seams (60–120s is normal)…`);
+          else if (ev.stage === 'rendering') setStatus(`Re-rendering with refined cuts… (${Math.round(ev.elapsed)}s)`);
+        } else if (ev.type === 'heartbeat') {
+          setStatus(`AI still listening… ${Math.round(ev.elapsed || 0)}s elapsed`);
+        } else if (ev.type === 'error') {
+          streamError = ev.error || 'optimize failed';
+        } else if (ev.type === 'result') {
+          finalResult = ev;
+        }
+      }
+    }
+    if (streamError) throw new Error(streamError);
+    if (!finalResult) throw new Error('optimize ended without a result (connection closed early)');
+    if (finalResult.ai_error) throw new Error(finalResult.ai_error);
+    if (!finalResult.audition) throw new Error('no audition returned');
+
+    appendAuditionCard(finalResult.audition);
+    setStatus('');
+    toast('Optimized audition ready — A/B compare below', 'success');
+  } catch (e) {
+    setStatus(e.message, 'error');
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+
+$('renderBestAuditionBtn')?.addEventListener('click', () => {
   const suggestion = state.aiSuggestion;
   if (!suggestion || !(suggestion.options || []).length) {
     toast('Run AI analysis first', 'error');
@@ -892,7 +1220,7 @@ $('renderBestAuditionBtn').addEventListener('click', () => {
   renderAuditions(plan ? [plan] : []);
 });
 
-$('renderAllAuditionsBtn').addEventListener('click', () => {
+$('renderAllAuditionsBtn')?.addEventListener('click', () => {
   const suggestion = state.aiSuggestion;
   if (!suggestion || !(suggestion.options || []).length) {
     toast('Run AI analysis first', 'error');
