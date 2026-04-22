@@ -1,0 +1,938 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Skating Music Editor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,ital,wght@9..144,0,300;9..144,0,500;9..144,1,400;9..144,1,500&family=Manrope:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/wavesurfer.js@7"></script>
+<script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/regions.min.js"></script>
+<script src="https://unpkg.com/wavesurfer.js@7/dist/plugins/timeline.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --bg-elev: #121829;
+    --bg-card: #161d31;
+    --line: #1e2742;
+    --ink: #e8edf7;
+    --ink-dim: #8a96b3;
+    --ink-faint: #5a6685;
+    --ice: #7fdbff;
+    --ice-bright: #b3ecff;
+    --cut: #ff5577;
+    --warn: #ffb84d;
+    --good: #6ee7a8;
+    --ai: #c794ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+    font-family: 'Manrope', system-ui, sans-serif; min-height: 100vh; }
+  body::before {
+    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(ellipse at 15% 0%, rgba(127,219,255,0.08), transparent 50%),
+      radial-gradient(ellipse at 85% 100%, rgba(199,148,255,0.06), transparent 50%);
+  }
+  .wrap { position: relative; z-index: 1; max-width: 1100px; margin: 0 auto; padding: 48px 32px; }
+
+  header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 40px;
+    border-bottom: 1px solid var(--line); padding-bottom: 24px; }
+  h1 { font-family: 'Fraunces', serif; font-weight: 300; font-size: 42px; margin: 0;
+    letter-spacing: -0.02em; }
+  h1 em { font-style: italic; color: var(--ice); font-weight: 500; }
+  .tagline { color: var(--ink-dim); font-size: 13px; letter-spacing: 0.05em;
+    text-transform: uppercase; }
+
+  .card { background: var(--bg-card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 28px; margin-bottom: 20px; }
+  .card.ai { border-color: rgba(199,148,255,0.3); background:
+    linear-gradient(180deg, rgba(199,148,255,0.04), transparent 60%), var(--bg-card); }
+
+  .upload-zone { border: 2px dashed var(--line); border-radius: 12px; padding: 48px;
+    text-align: center; cursor: pointer; transition: all 0.2s; background: var(--bg-elev); }
+  .upload-zone:hover, .upload-zone.drag {
+    border-color: var(--ice); background: rgba(127,219,255,0.04); }
+  .upload-zone .icon { font-family: 'Fraunces', serif; font-size: 56px; color: var(--ice);
+    font-weight: 300; line-height: 1; margin-bottom: 12px; }
+  .upload-zone .label { font-size: 16px; color: var(--ink); margin-bottom: 6px; }
+  .upload-zone .hint { font-size: 12px; color: var(--ink-faint); }
+  #fileInput { display: none; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+    background: var(--line); border-radius: 12px; overflow: hidden; margin-bottom: 20px; }
+  .stat { background: var(--bg-card); padding: 18px 20px; }
+  .stat .k { font-size: 11px; color: var(--ink-faint); text-transform: uppercase;
+    letter-spacing: 0.08em; margin-bottom: 6px; }
+  .stat .v { font-family: 'Fraunces', serif; font-size: 28px; font-weight: 400;
+    color: var(--ink); letter-spacing: -0.02em; }
+  .stat .v.ice { color: var(--ice); }
+  .stat .v.cut { color: var(--cut); }
+  .stat .v.warn { color: var(--warn); }
+  .stat .v.good { color: var(--good); }
+  .stat .sub { font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
+
+  #waveform { background: var(--bg-elev); border-radius: 8px; padding: 16px;
+    border: 1px solid var(--line); }
+  #timeline { margin-top: 4px; }
+
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
+  button { font-family: 'Manrope', sans-serif; font-size: 13px; font-weight: 500;
+    padding: 10px 18px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg-elev); color: var(--ink); cursor: pointer;
+    transition: all 0.15s; letter-spacing: 0.02em; }
+  button:hover:not(:disabled) { border-color: var(--ice); color: var(--ice); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: var(--ice); color: var(--bg); border-color: var(--ice);
+    font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: var(--ice-bright); border-color: var(--ice-bright);
+    color: var(--bg); }
+  button.cut { background: transparent; border-color: var(--cut); color: var(--cut); }
+  button.cut:hover:not(:disabled) { background: var(--cut); color: var(--bg); }
+  button.ai { background: transparent; border-color: var(--ai); color: var(--ai); }
+  button.ai:hover:not(:disabled) { background: var(--ai); color: var(--bg); }
+
+  .settings { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
+  .field label { display: block; font-size: 11px; color: var(--ink-faint);
+    text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+  .field input, .field select {
+    width: 100%; padding: 10px 12px; background: var(--bg-elev); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 6px; font-family: inherit;
+    font-size: 14px; }
+  .field input:focus, .field select:focus { outline: none; border-color: var(--ice); }
+
+  .cuts-list { margin-top: 16px; max-height: 240px; overflow-y: auto; }
+  .cut-row { display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px; background: var(--bg-elev); border: 1px solid var(--line);
+    border-radius: 6px; margin-bottom: 6px; font-size: 13px; gap: 12px; }
+  .cut-row .range { font-family: 'Fraunces', serif; font-size: 15px; }
+  .cut-row .dur { color: var(--ink-dim); margin-left: 10px; font-size: 12px; }
+  .cut-row .reason { color: var(--ink-dim); font-size: 12px; flex: 1; font-style: italic; }
+  .cut-row .del { background: transparent; border: none; color: var(--cut);
+    cursor: pointer; font-size: 18px; padding: 0 6px; }
+
+  .empty-cuts { color: var(--ink-faint); font-size: 13px; font-style: italic;
+    padding: 20px; text-align: center; }
+
+  .section-title { font-family: 'Fraunces', serif; font-size: 22px; font-weight: 400;
+    margin: 0 0 18px 0; letter-spacing: -0.01em; display: flex; align-items: baseline; gap: 12px; }
+  .section-title small { font-family: 'Manrope', sans-serif; font-size: 12px;
+    color: var(--ink-faint); font-weight: 400;
+    text-transform: uppercase; letter-spacing: 0.08em; }
+  .section-title .badge { font-family: 'Manrope', sans-serif; font-size: 10px;
+    background: rgba(199,148,255,0.15); color: var(--ai); padding: 3px 8px;
+    border-radius: 100px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600; }
+
+  .toast { position: fixed; bottom: 24px; right: 24px; padding: 14px 20px;
+    background: var(--bg-card); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--ink); font-size: 13px; opacity: 0; transform: translateY(10px);
+    transition: all 0.2s; pointer-events: none; z-index: 100; max-width: 380px; }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.error { border-color: var(--cut); }
+  .toast.success { border-color: var(--good); }
+
+  .hidden { display: none !important; }
+
+  .help { margin-top: 16px; padding: 14px 18px; background: var(--bg-elev);
+    border-left: 2px solid var(--ice); border-radius: 4px; font-size: 13px;
+    color: var(--ink-dim); line-height: 1.6; }
+  .help b { color: var(--ink); font-weight: 600; }
+
+  .download-link { display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 20px; background: var(--good); color: var(--bg);
+    border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 14px; }
+  .download-link:hover { background: #8aedb8; }
+
+  /* AI panel */
+  .ai-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px;
+    background: var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+  .ai-summary .stat { padding: 14px 18px; }
+  .ai-summary .v { font-size: 22px; }
+
+  .ai-rationale { padding: 16px 18px; background: var(--bg-elev);
+    border-left: 2px solid var(--ai); border-radius: 4px; margin-bottom: 16px;
+    font-size: 14px; line-height: 1.65; }
+  .ai-rationale .label { display: block; font-size: 10px; color: var(--ai);
+    text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; margin-bottom: 6px; }
+  .ai-rationale .struct { color: var(--ink-dim); font-size: 13px;
+    font-style: italic; margin-top: 10px; padding-top: 10px;
+    border-top: 1px solid var(--line); }
+  .ai-rationale .warn { color: var(--warn); font-size: 12px; margin-top: 8px; }
+
+  .ai-cuts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+  .ai-cut { display: flex; gap: 14px; align-items: flex-start; padding: 12px 14px;
+    background: var(--bg-elev); border: 1px solid var(--line); border-radius: 6px; }
+  .ai-cut .range { font-family: 'Fraunces', serif; font-size: 16px; color: var(--ai);
+    min-width: 130px; }
+  .ai-cut .reason { color: var(--ink-dim); font-size: 13px; line-height: 1.5; flex: 1; }
+
+  .plan-grid { display: flex; flex-direction: column; gap: 14px; margin-bottom: 18px; }
+  .plan-card { background: var(--bg-elev); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .plan-card.best { border-color: var(--ai); box-shadow: inset 0 0 0 1px rgba(199,148,255,0.25); }
+  .plan-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .plan-title { font-family: 'Fraunces', serif; font-size: 20px; color: var(--ink); }
+  .plan-pill { font-size: 11px; padding: 4px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-dim); }
+  .plan-summary { color: var(--ink-dim); font-size: 13px; line-height: 1.55; margin-bottom: 12px; }
+  .mini-candidates { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--ink-faint); font-size: 12px; }
+  .mini-candidates code { color: var(--ice-bright); }
+
+  .audition-grid { display: flex; flex-direction: column; gap: 14px; margin-top: 16px; }
+  .audition-card { background: var(--bg-elev); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .audition-card audio { width: 100%; margin-top: 10px; }
+  .audition-meta { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .audition-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+  .audition-loading { padding: 14px 16px; border: 1px dashed var(--line); border-radius: 10px; color: var(--ink-dim); }
+
+  .analysis-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .analysis-card { background: var(--bg-elev); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .analysis-card img { width: 100%; border-radius: 8px; border: 1px solid var(--line); display: block; background: #0d1322; }
+  .feature-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
+  .feature-item .k { color: var(--ink-faint); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+  .feature-item .v { font-size: 18px; color: var(--ink); }
+  .feature-item .sub { color: var(--ink-dim); font-size: 12px; line-height: 1.45; }
+  .intervals { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .interval-tag { font-size: 11px; padding: 4px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-dim); }
+
+  .ai-loading { display: flex; align-items: center; gap: 12px; color: var(--ink-dim);
+    font-size: 14px; padding: 24px; justify-content: center; }
+  .spinner { width: 18px; height: 18px; border: 2px solid var(--line);
+    border-top-color: var(--ai); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .ai-empty { text-align: center; padding: 24px; color: var(--ink-dim); font-size: 14px; }
+  .ai-empty p { margin: 0 0 12px 0; }
+
+  /* Section boundary markers on the waveform */
+  ::part(region) { border-radius: 0 !important; }
+
+  @media (max-width: 720px) {
+    .wrap { padding: 24px 16px; }
+    h1 { font-size: 32px; }
+    .stats, .settings, .ai-summary { grid-template-columns: repeat(2, 1fr); }
+    .analysis-grid { grid-template-columns: 1fr; }
+    .feature-list { grid-template-columns: 1fr; }
+    .ai-cut { flex-direction: column; gap: 4px; }
+    .ai-cut .range { min-width: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Skating Music <em>Editor</em></h1>
+    <div class="tagline">Cut · Crossfade · AI · Export</div>
+  </header>
+
+  <!-- Step 1: Upload -->
+  <div class="card" id="uploadCard">
+    <label class="upload-zone" id="uploadZone" for="fileInput">
+      <div class="icon">+</div>
+      <div class="label">Drop an audio file here or click to browse</div>
+      <div class="hint">MP3 · WAV · M4A · FLAC · OGG · max 50MB</div>
+    </label>
+    <input type="file" id="fileInput" accept="audio/*" />
+  </div>
+
+  <!-- Step 2: Editor -->
+  <div id="editor" class="hidden">
+
+    <div class="stats">
+      <div class="stat">
+        <div class="k">Original</div>
+        <div class="v" id="statOrig">—</div>
+        <div class="sub" id="statOrigName">—</div>
+      </div>
+      <div class="stat">
+        <div class="k">Cut</div>
+        <div class="v cut" id="statCut">0:00</div>
+        <div class="sub"><span id="statCutCount">0</span> region(s)</div>
+      </div>
+      <div class="stat">
+        <div class="k">Result</div>
+        <div class="v ice" id="statResult">—</div>
+        <div class="sub">after edits</div>
+      </div>
+      <div class="stat">
+        <div class="k">Target</div>
+        <div class="v" id="statTarget">—</div>
+        <div class="sub" id="statTargetDelta">—</div>
+      </div>
+    </div>
+
+    <!-- Waveform -->
+    <div class="card">
+      <h2 class="section-title">
+        Waveform
+        <small>click + drag to mark a section to cut</small>
+      </h2>
+      <div id="waveform"></div>
+      <div id="timeline"></div>
+      <div class="controls">
+        <button id="playBtn">▶ Play</button>
+        <button id="stopBtn">■ Stop</button>
+        <button class="cut" id="addCutBtn">+ Add cut at playhead</button>
+        <button id="clearCutsBtn">Clear all cuts</button>
+        <span style="margin-left:auto; color: var(--ink-faint); font-size: 12px;"
+              id="boundaryHint"></span>
+      </div>
+    </div>
+
+    <!-- AI Analysis -->
+    <div class="card ai" id="aiCard">
+      <h2 class="section-title">
+        AI Cut Suggestions
+        <span class="badge">Hybrid AI</span>
+      </h2>
+
+      <div class="settings" style="grid-template-columns: 1fr 1fr 0.9fr 0.9fr 0.9fr auto; gap: 16px; align-items: end;">
+        <div class="field">
+          <label>Target program length</label>
+          <select id="aiTargetLen">
+            <option value="">— pick a length —</option>
+            <option value="90">No-Test / Pre-Pre · 1:30</option>
+            <option value="105">Pre-Juvenile · 1:45</option>
+            <option value="120">Juvenile · 2:00</option>
+            <option value="150">Intermediate · 2:30</option>
+            <option value="180">Novice · 3:00</option>
+            <option value="210">Junior · 3:30</option>
+            <option value="240" selected>Senior FS · 4:00</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Discipline / context</label>
+          <input type="text" id="aiDiscipline" placeholder="e.g. Junior ladies free skate, lyrical" />
+        </div>
+        <div class="field">
+          <label>AI style</label>
+          <select id="aiStyle">
+            <option value="balanced" selected>Balanced</option>
+            <option value="dramatic">Dramatic</option>
+            <option value="lyrical">Lyrical</option>
+            <option value="technical">Technical</option>
+            <option value="aggressive">Aggressive</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>AI provider</label>
+          <select id="aiProvider">
+            <option value="gemini" selected>Gemini multimodal audio</option>
+            <option value="claude">Claude fallback (feature-only)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Aggressiveness</label>
+          <input type="range" id="aiAggressiveness" min="0" max="100" step="5" value="50" />
+          <div class="sub" id="aiAggroLabel" style="margin-top:6px; color: var(--ink-faint); font-size: 12px;">50 · moderate</div>
+        </div>
+        <div>
+          <button class="ai" id="aiBtn">✨ Analyze &amp; build plans</button>
+        </div>
+      </div>
+
+      <div id="aiResult" class="hidden" style="margin-top: 20px;"></div>
+
+      <div id="aiEmpty" class="ai-empty">
+        <p>Pick a target length and click <b>Analyze</b>. Gemini mode sends the actual audio file to a multimodal model, then cross-checks the result against local structure analysis before ranking plans.</p>
+        <p style="font-size: 12px; color: var(--ink-faint);">
+          Preferred: <code>GEMINI_API_KEY</code> for full audio understanding. Optional fallback: <code>ANTHROPIC_API_KEY</code> for feature-only planning.
+        </p>
+      </div>
+    </div>
+
+    <!-- Cut regions -->
+    <div class="card">
+      <h2 class="section-title">Cut regions</h2>
+      <div class="cuts-list" id="cutsList">
+        <div class="empty-cuts">No cuts yet — drag on the waveform above, or use AI suggestions.</div>
+      </div>
+    </div>
+
+    <!-- Export -->
+    <div class="card">
+      <h2 class="section-title">Export settings</h2>
+      <div class="settings">
+        <div class="field">
+          <label>Crossfade between cuts (ms)</label>
+          <input type="number" id="crossfadeMs" value="250" min="0" max="2000" step="50" />
+        </div>
+        <div class="field">
+          <label>Fade-in start (ms)</label>
+          <input type="number" id="fadeInMs" value="100" min="0" max="5000" step="50" />
+        </div>
+        <div class="field">
+          <label>Fade-out end (ms)</label>
+          <input type="number" id="fadeOutMs" value="2000" min="0" max="10000" step="100" />
+        </div>
+        <div class="field">
+          <label>Output format</label>
+          <select id="targetFormat">
+            <option value="mp3" selected>MP3</option>
+            <option value="wav">WAV (lossless)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>MP3 bitrate</label>
+          <select id="bitrate">
+            <option value="128k">128 kbps</option>
+            <option value="192k" selected>192 kbps (recommended)</option>
+            <option value="256k">256 kbps</option>
+            <option value="320k">320 kbps</option>
+          </select>
+        </div>
+      </div>
+      <div class="controls" style="margin-top: 24px;">
+        <button class="primary" id="exportBtn">Export edited program</button>
+        <span id="downloadSlot"></span>
+      </div>
+    </div>
+
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (s) => {
+  if (!isFinite(s)) return '—';
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${String(sec).padStart(2, '0')}`;
+};
+const toast = (msg, kind = '') => {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = `toast show ${kind}`;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove('show'), 4500);
+};
+
+let ws = null;
+let regionsPlugin = null;
+let state = {
+  fileId: null, ext: null, duration: 0, originalName: '',
+  sectionBoundaries: [], aiSuggestion: null,
+};
+
+function updateAggroLabel() {
+  const v = parseInt($('aiAggressiveness').value || '50', 10);
+  let label = 'moderate';
+  if (v <= 20) label = 'very conservative';
+  else if (v <= 40) label = 'conservative';
+  else if (v <= 60) label = 'moderate';
+  else if (v <= 80) label = 'assertive';
+  else label = 'very aggressive';
+  $('aiAggroLabel').textContent = `${v} · ${label}`;
+}
+
+// ───────── Upload ─────────
+const zone = $('uploadZone');
+const input = $('fileInput');
+['dragenter','dragover'].forEach(e => zone.addEventListener(e, ev => {
+  ev.preventDefault(); zone.classList.add('drag');
+}));
+['dragleave','drop'].forEach(e => zone.addEventListener(e, ev => {
+  ev.preventDefault(); zone.classList.remove('drag');
+}));
+zone.addEventListener('drop', ev => {
+  if (ev.dataTransfer.files.length) handleUpload(ev.dataTransfer.files[0]);
+});
+input.addEventListener('change', () => {
+  if (input.files.length) handleUpload(input.files[0]);
+});
+
+async function handleUpload(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  toast('Uploading…');
+  try {
+    const r = await fetch('/upload', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'upload failed');
+    state.fileId = j.file_id;
+    state.ext = j.ext;
+    state.duration = j.duration_sec;
+    state.originalName = j.original_name;
+    $('uploadCard').classList.add('hidden');
+    $('editor').classList.remove('hidden');
+    $('statOrig').textContent = fmt(state.duration);
+    $('statOrigName').textContent = state.originalName;
+    initWaveform();
+    toast('Loaded — drag to mark cuts, or use AI suggestions below', 'success');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ───────── Waveform ─────────
+function initWaveform() {
+  if (ws) { ws.destroy(); }
+  regionsPlugin = WaveSurfer.Regions.create();
+  ws = WaveSurfer.create({
+    container: '#waveform',
+    waveColor: '#3a4566',
+    progressColor: '#7fdbff',
+    cursorColor: '#b3ecff',
+    barWidth: 2, barGap: 1, barRadius: 2,
+    height: 140,
+    url: `/audio/${state.fileId}.${state.ext}`,
+    plugins: [
+      regionsPlugin,
+      WaveSurfer.Timeline.create({ container: '#timeline' }),
+    ],
+  });
+
+  ws.on('ready', () => {
+    regionsPlugin.enableDragSelection({ color: 'rgba(255, 85, 119, 0.25)' });
+  });
+
+  regionsPlugin.on('region-created', (region) => {
+    // Cut regions are red. AI-suggested regions are pre-tagged purple.
+    if (!region._aiTag) {
+      region.setOptions({ color: 'rgba(255, 85, 119, 0.25)' });
+    }
+    refreshCuts();
+  });
+  regionsPlugin.on('region-updated', refreshCuts);
+  regionsPlugin.on('region-removed', refreshCuts);
+}
+
+$('playBtn').addEventListener('click', () => ws && ws.playPause());
+$('stopBtn').addEventListener('click', () => ws && ws.stop());
+$('clearCutsBtn').addEventListener('click', () => {
+  regionsPlugin.clearRegions();
+  refreshCuts();
+});
+$('addCutBtn').addEventListener('click', () => {
+  if (!ws) return;
+  const t = ws.getCurrentTime();
+  regionsPlugin.addRegion({
+    start: t, end: Math.min(t + 5, state.duration),
+    color: 'rgba(255, 85, 119, 0.25)',
+    drag: true, resize: true,
+  });
+});
+
+function getCuts() {
+  if (!regionsPlugin) return [];
+  return regionsPlugin.getRegions()
+    .filter(r => !r._isMarker)
+    .map(r => ({ start: r.start, end: r.end, id: r.id, reason: r._reason || '' }))
+    .sort((a, b) => a.start - b.start);
+}
+
+function refreshCuts() {
+  const cuts = getCuts();
+  const list = $('cutsList');
+  if (cuts.length === 0) {
+    list.innerHTML = '<div class="empty-cuts">No cuts yet — drag on the waveform above, or use AI suggestions.</div>';
+  } else {
+    list.innerHTML = cuts.map(c => {
+      const dur = c.end - c.start;
+      const reason = c.reason
+        ? `<span class="reason">${escapeHtml(c.reason)}</span>` : '';
+      return `<div class="cut-row">
+        <div>
+          <span class="range">${fmt(c.start)} → ${fmt(c.end)}</span>
+          <span class="dur">(${dur.toFixed(1)}s)</span>
+        </div>
+        ${reason}
+        <button class="del" data-id="${c.id}" title="Remove cut">×</button>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.del').forEach(b => {
+      b.addEventListener('click', () => {
+        const r = regionsPlugin.getRegions().find(x => x.id === b.dataset.id);
+        if (r) r.remove();
+      });
+    });
+  }
+
+  const totalCut = cuts.reduce((s, c) => s + (c.end - c.start), 0);
+  const result = state.duration - totalCut;
+  $('statCut').textContent = fmt(totalCut);
+  $('statCutCount').textContent = cuts.length;
+  $('statResult').textContent = fmt(result);
+
+  updateTarget(result);
+}
+
+function updateTarget(result) {
+  const target = parseFloat($('aiTargetLen').value);
+  if (!target) {
+    $('statTarget').textContent = '—';
+    $('statTarget').className = 'v';
+    $('statTargetDelta').textContent = 'no target set';
+    return;
+  }
+  $('statTarget').textContent = fmt(target);
+  const delta = result - target;
+  if (Math.abs(delta) <= 5) {
+    $('statTarget').className = 'v good';
+    $('statTargetDelta').textContent = `within 5s of target ✓`;
+  } else if (delta > 0) {
+    $('statTarget').className = 'v warn';
+    $('statTargetDelta').textContent = `${Math.round(delta)}s over target`;
+  } else {
+    $('statTarget').className = 'v warn';
+    $('statTargetDelta').textContent = `${Math.round(-delta)}s under target`;
+  }
+}
+
+$('aiTargetLen').addEventListener('change', () => refreshCuts());
+$('aiAggressiveness').addEventListener('input', updateAggroLabel);
+updateAggroLabel();
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+// ───────── AI Analysis ─────────
+$('aiBtn').addEventListener('click', async () => {
+  const target = parseFloat($('aiTargetLen').value);
+  if (!target) { toast('Pick a target length first', 'error'); return; }
+
+  const btn = $('aiBtn');
+  btn.disabled = true;
+  btn.textContent = 'Analyzing…';
+  $('aiEmpty').classList.add('hidden');
+  $('aiResult').classList.remove('hidden');
+  $('aiResult').innerHTML = `
+    <div class="ai-loading">
+      <div class="spinner"></div>
+      <div>Running multimodal audio analysis + structure verification…<br>
+        <span style="font-size: 12px; color: var(--ink-faint);">
+          returns ranked edit plans with confidence, transition risk, and audio-aware cut reasoning
+        </span>
+      </div>
+    </div>`;
+
+  try {
+    const r = await fetch('/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_id: state.fileId, ext: state.ext,
+        target_sec: target,
+        discipline: $('aiDiscipline').value || '',
+        program_style: $('aiStyle').value,
+        aggressiveness: parseInt($('aiAggressiveness').value || '50', 10),
+        num_options: 3,
+        use_ai: true,
+        ai_provider: $('aiProvider').value,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'analysis failed');
+
+    state.sectionBoundaries = j.analysis.section_boundaries || [];
+    state.aiSuggestion = j.suggestion;
+
+    // Render section boundary markers on the waveform
+    drawSectionMarkers(state.sectionBoundaries);
+    $('boundaryHint').textContent =
+      `${state.sectionBoundaries.length} section boundaries detected (purple ticks)`;
+
+    renderAIResult(j.analysis, j.suggestion, j.ai_error);
+    toast('Analysis complete', 'success');
+  } catch (e) {
+    $('aiResult').innerHTML = `<div class="ai-empty" style="color: var(--cut);">
+      <p><b>Analysis failed:</b> ${escapeHtml(e.message)}</p></div>`;
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '✨ Rebuild plans';
+  }
+});
+
+function drawSectionMarkers(boundaries) {
+  // Remove old markers
+  regionsPlugin.getRegions()
+    .filter(r => r._isMarker).forEach(r => r.remove());
+  // Add new ones as zero-width regions (vertical lines)
+  for (const t of boundaries) {
+    const r = regionsPlugin.addRegion({
+      start: t, end: t + 0.01,
+      color: 'rgba(199,148,255,0.7)',
+      drag: false, resize: false,
+    });
+    r._isMarker = true;
+  }
+}
+
+function renderAIResult(analysis, suggestion, aiError) {
+  const keyLabel = analysis.estimated_key?.label || '—';
+  const keyConf = analysis.estimated_key?.confidence;
+  const vocalIntervals = analysis.likely_vocal_intervals || [];
+  let html = `
+    <div class="ai-summary">
+      <div class="stat">
+        <div class="k">Tempo</div>
+        <div class="v ice">${analysis.tempo_bpm}</div>
+        <div class="sub">BPM</div>
+      </div>
+      <div class="stat">
+        <div class="k">Sections</div>
+        <div class="v">${analysis.section_boundaries.length + 1}</div>
+        <div class="sub">${analysis.section_boundaries.length} boundaries</div>
+      </div>
+      <div class="stat">
+        <div class="k">Climax</div>
+        <div class="v">${fmt(analysis.estimated_climax_time || 0)}</div>
+        <div class="sub">estimated peak</div>
+      </div>
+    </div>
+    <div class="analysis-grid">
+      <div class="analysis-card">
+        <div class="section-title" style="font-size:18px; margin-bottom:12px;">Waveform image <small>server-rendered preview</small></div>
+        ${analysis.waveform_image_url
+          ? `<img src="${analysis.waveform_image_url}" alt="Waveform preview" />`
+          : `<div class="ai-empty" style="padding:12px 0;">${escapeHtml(analysis.waveform_image_error || 'Waveform image unavailable')}</div>`}
+      </div>
+      <div class="analysis-card">
+        <div class="section-title" style="font-size:18px; margin-bottom:12px;">Richer local features <small>librosa pass</small></div>
+        <div class="feature-list">
+          <div class="feature-item">
+            <div class="k">Estimated key / mode</div>
+            <div class="v">${escapeHtml(keyLabel)}</div>
+            <div class="sub">${keyConf != null ? `confidence ${(keyConf * 100).toFixed(0)}%` : 'heuristic tonal estimate'}</div>
+          </div>
+          <div class="feature-item">
+            <div class="k">Chord-change density</div>
+            <div class="v">${escapeHtml(String(analysis.chord_change_density_per_min ?? '—'))}</div>
+            <div class="sub">changes per minute · higher means more harmonic motion</div>
+          </div>
+          <div class="feature-item">
+            <div class="k">Vocal presence</div>
+            <div class="v">${analysis.vocal_presence_ratio != null ? `${(analysis.vocal_presence_ratio * 100).toFixed(0)}%` : '—'}</div>
+            <div class="sub">share of frames flagged as likely vocal</div>
+          </div>
+          <div class="feature-item">
+            <div class="k">Phrase grid</div>
+            <div class="v">${escapeHtml(String(analysis.phrase_grid_sec ?? '—'))}s</div>
+            <div class="sub">used to propose phrase-aligned cuts</div>
+          </div>
+        </div>
+        <div class="intervals">
+          ${vocalIntervals.length
+            ? vocalIntervals.slice(0, 8).map(iv => `<span class="interval-tag">vocals ${fmt(iv.start)}–${fmt(iv.end)}</span>`).join('')
+            : '<span class="interval-tag">No clear vocal intervals detected</span>'}
+        </div>
+      </div>
+    </div>`;
+
+  if (aiError) {
+    html += `<div class="ai-rationale" style="border-left-color: var(--cut);">
+      <span class="label" style="color: var(--cut);">AI planning unavailable</span>
+      ${escapeHtml(aiError)}
+      <div class="struct">Local analysis still ran. Section boundaries are drawn on the waveform, a waveform image was rendered, and the app identified ${analysis.local_candidates?.length || 0} low-risk cut candidates.</div>
+    </div>`;
+  } else if (suggestion) {
+    html += `<div class="ai-rationale">
+      <span class="label">${escapeHtml((suggestion.provider || 'ai').toUpperCase())} · ${escapeHtml(suggestion.model || '')}</span>
+      ${escapeHtml(suggestion.rationale || '')}
+      ${suggestion.structure_notes
+        ? `<div class="struct">Song shape: ${escapeHtml(suggestion.structure_notes)}</div>`
+        : ''}
+      ${suggestion.warnings
+        ? `<div class="warn">⚠ ${escapeHtml(suggestion.warnings)}</div>`
+        : ''}
+    </div>`;
+
+    const options = suggestion.options || [];
+    if (options.length > 0) {
+      html += `<div class="plan-grid">`;
+      options.forEach((opt, idx) => {
+        html += `<div class="plan-card ${idx === suggestion.best_option_index ? 'best' : ''}">
+          <div class="plan-head">
+            <div class="plan-title">${escapeHtml(opt.title || `Plan ${idx + 1}`)}</div>
+            ${idx === suggestion.best_option_index ? `<span class="plan-pill" style="color: var(--ai); border-color: var(--ai);">best</span>` : ''}
+            <span class="plan-pill">confidence ${escapeHtml(String(opt.confidence ?? '—'))}</span>
+            <span class="plan-pill">remove ${escapeHtml((opt.removed_sec || 0).toFixed(1))}s</span>
+            <span class="plan-pill">risk ${escapeHtml(opt.transition_risk || 'medium')}</span>
+          </div>
+          <div class="plan-summary">${escapeHtml(opt.summary || '')}</div>
+          <div class="ai-cuts">
+            ${(opt.cuts || []).map(c => `<div class="ai-cut">
+              <div class="range">${fmt(c.start)} → ${fmt(c.end)}
+                <span style="font-size: 11px; color: var(--ink-faint);">(${(c.end - c.start).toFixed(1)}s)</span>
+              </div>
+              <div class="reason">${escapeHtml(c.reason || '')}<br>
+                <span style="font-size:11px;color:var(--ink-faint);">transition penalty ${(c.transition_penalty ?? 0).toFixed(3)}</span>
+              </div>
+            </div>`).join('')}
+          </div>
+          <div class="controls">
+            <button class="ai applyPlanBtn" data-plan="${idx}">Apply this plan</button>
+            <button class="renderAuditionBtn" data-plan="${idx}">Render audition</button>
+          </div>
+        </div>`;
+      });
+      html += `</div>`;
+    }
+
+    if ((analysis.local_candidates || []).length) {
+      html += `<div class="mini-candidates"><b>Local low-risk candidates:</b> ${analysis.local_candidates.slice(0, 5).map(c => `<code>${fmt(c.start)}→${fmt(c.end)}</code>`).join(' · ')}</div>`;
+    }
+  }
+
+  $('aiResult').innerHTML = html;
+  $('auditionPanel').classList.toggle('hidden', !(suggestion && (suggestion.options || []).length));
+  document.querySelectorAll('.applyPlanBtn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = parseInt(btn.dataset.plan, 10);
+      const plan = (suggestion.options || [])[idx];
+      if (plan) applyAICuts(plan.cuts);
+    });
+  });
+  document.querySelectorAll('.renderAuditionBtn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = parseInt(btn.dataset.plan, 10);
+      const plan = (suggestion.options || [])[idx];
+      if (plan) renderAuditions([plan]);
+    });
+  });
+}
+
+function applyAICuts(cuts) {
+  // Clear existing cut regions (but keep section markers)
+  regionsPlugin.getRegions()
+    .filter(r => !r._isMarker).forEach(r => r.remove());
+  // Add the AI-suggested cuts
+  for (const c of cuts) {
+    const r = regionsPlugin.addRegion({
+      start: c.start, end: c.end,
+      color: 'rgba(199,148,255,0.3)',
+      drag: true, resize: true,
+    });
+    r._aiTag = true;
+    r._reason = c.reason;
+  }
+  refreshCuts();
+  toast(`Applied ${cuts.length} AI-suggested cuts — refine on the waveform`, 'success');
+}
+
+
+async function renderAuditions(plans) {
+  if (!plans || !plans.length) {
+    toast('No plans available to audition', 'error');
+    return;
+  }
+  $('auditionPanel').classList.remove('hidden');
+  $('auditionResult').innerHTML = `<div class="audition-loading">Rendering ${plans.length > 1 ? plans.length + ' audition previews' : 'audition preview'}…</div>`;
+  try {
+    const payloadPlans = plans.map((plan, idx) => ({
+      plan_id: idx,
+      title: plan.title,
+      summary: plan.summary,
+      cuts: (plan.cuts || []).map(c => ({ start: c.start, end: c.end })),
+    }));
+    const r = await fetch('/render_auditions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_id: state.fileId,
+        ext: state.ext,
+        plans: payloadPlans,
+        target_format: $('targetFormat').value,
+        bitrate: $('bitrate').value,
+        crossfade_ms: Math.min(parseInt($('crossfadeMs').value || '250', 10), 250),
+        fade_in_ms: Math.min(parseInt($('fadeInMs').value || '100', 10), 150),
+        fade_out_ms: Math.min(parseInt($('fadeOutMs').value || '2000', 10), 800),
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'audition render failed');
+    drawAuditions(j.auditions || []);
+    toast('Audition renders ready', 'success');
+  } catch (e) {
+    $('auditionResult').innerHTML = `<div class="ai-empty" style="color: var(--cut);">${escapeHtml(e.message)}</div>`;
+    toast(e.message, 'error');
+  }
+}
+
+function drawAuditions(auditions) {
+  if (!auditions.length) {
+    $('auditionResult').innerHTML = `<div class="ai-empty">No auditions were rendered.</div>`;
+    return;
+  }
+  $('auditionResult').innerHTML = `<div class="audition-grid">${auditions.map((a, idx) => {
+    if (a.error) {
+      return `<div class="audition-card"><div class="plan-title">${escapeHtml(a.title || `Plan ${idx + 1}`)}</div><div class="warn">${escapeHtml(a.error)}</div></div>`;
+    }
+    return `<div class="audition-card">
+      <div class="plan-head">
+        <div class="plan-title">${escapeHtml(a.title || `Plan ${idx + 1}`)}</div>
+      </div>
+      <div class="plan-summary">${escapeHtml(a.summary || '')}</div>
+      <div class="audition-meta">
+        <span class="plan-pill">${fmt(a.duration_sec)}</span>
+        <span class="plan-pill">${escapeHtml(String(Math.round((a.size_bytes || 0) / 1024)))} KB</span>
+        <span class="plan-pill">${escapeHtml((a.format || '').toUpperCase())}</span>
+      </div>
+      <audio controls preload="none" src="${a.preview_url}"></audio>
+      <div class="audition-actions">
+        <a class="download-link" href="${a.download_url}" download>Download audition</a>
+      </div>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+$('renderBestAuditionBtn').addEventListener('click', () => {
+  const suggestion = state.aiSuggestion;
+  if (!suggestion || !(suggestion.options || []).length) {
+    toast('Run AI analysis first', 'error');
+    return;
+  }
+  const idx = suggestion.best_option_index || 0;
+  const plan = (suggestion.options || [])[idx];
+  renderAuditions(plan ? [plan] : []);
+});
+
+$('renderAllAuditionsBtn').addEventListener('click', () => {
+  const suggestion = state.aiSuggestion;
+  if (!suggestion || !(suggestion.options || []).length) {
+    toast('Run AI analysis first', 'error');
+    return;
+  }
+  renderAuditions(suggestion.options || []);
+});
+
+// ───────── Export ─────────
+$('exportBtn').addEventListener('click', async () => {
+  const cuts = getCuts().map(c => ({ start: c.start, end: c.end }));
+  const body = {
+    file_id: state.fileId, ext: state.ext, cuts,
+    crossfade_ms: parseInt($('crossfadeMs').value) || 0,
+    fade_in_ms: parseInt($('fadeInMs').value) || 0,
+    fade_out_ms: parseInt($('fadeOutMs').value) || 0,
+    target_format: $('targetFormat').value,
+    bitrate: $('bitrate').value,
+  };
+  $('exportBtn').disabled = true;
+  $('exportBtn').textContent = 'Exporting…';
+  try {
+    const r = await fetch('/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'export failed');
+    const url = `/download/${j.output_id}.${j.format}`;
+    $('downloadSlot').innerHTML =
+      `<a class="download-link" href="${url}" download>↓ Download (${fmt(j.duration_sec)})</a>`;
+    toast(`Done — ${fmt(j.duration_sec)} program ready`, 'success');
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    $('exportBtn').disabled = false;
+    $('exportBtn').textContent = 'Export edited program';
+  }
+});
+</script>
+</body>
+</html>
